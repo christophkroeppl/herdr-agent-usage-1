@@ -86,6 +86,24 @@ type CollectKiloLimitsOptions struct {
 	Now func() int64
 }
 
+// kiloPassOutcome is what one fetch of the Kilo Pass state actually established.
+//
+// The three cases must not be collapsed. Kilo upstream reads a null
+// subscription and a non-live status as "no consumable Pass", not as a failed
+// request, and that distinction decides whether a pane is cleared or preserved.
+type kiloPassOutcome int
+
+const (
+	// kiloPassAllowance: a metered window.
+	kiloPassAllowance kiloPassOutcome = iota
+	// kiloPassNoPass: Kilo answered, and answered that there is nothing to
+	// meter. This clears any window this account had.
+	kiloPassNoPass
+	// kiloPassFailed: the request, the decode, or the shape failed. Kilo said
+	// nothing about the account, so nothing is cleared.
+	kiloPassFailed
+)
+
 // CollectKiloLimits builds a ProviderLimits for one Kilo account.
 //
 // The ladder is deliberate. A window only ever comes from a Kilo Pass
@@ -93,6 +111,10 @@ type CollectKiloLimitsOptions struct {
 // produces a note naming the cause rather than a fabricated bar. The result is
 // cached against the login's identity, so a second account on the same machine
 // never sees the first one's numbers.
+//
+// The cache carries the outcome separately from the snapshot, because a failed
+// fetch must record that it happened — so the next refresh does not re-hit the
+// endpoint — without destroying the last good reading it did not disprove.
 func CollectKiloLimits(nowMs int64, opts CollectKiloLimitsOptions) ProviderLimits {
 	const providerID = "kilo"
 	const label = "Kilo"
@@ -108,9 +130,10 @@ func CollectKiloLimits(nowMs int64, opts CollectKiloLimitsOptions) ProviderLimit
 		return pl
 	}
 
-	if cached, fresh := loadKiloCache(nowMs, credential.AccountID); fresh && cached.Limits != nil {
-		pl := *cached.Limits
-		pl.FetchedAtMs = cached.FetchedAtMs
+	previous, _ := readKiloCache()
+	if previous.AccountID == credential.AccountID && kiloCacheFresh(previous, credential.AccountID, nowMs) && previous.Limits != nil {
+		pl := *previous.Limits
+		pl.FetchedAtMs = previous.FetchedAtMs
 		return pl
 	}
 
@@ -125,22 +148,34 @@ func CollectKiloLimits(nowMs int64, opts CollectKiloLimitsOptions) ProviderLimit
 
 	balance, balanceErr := fetchBalance(credential.Access)
 	pass, passErr := fetchPass(credential.Access)
-	pl := kiloProviderLimits(providerID, label, pass, passErr, balance, balanceErr, nowMs)
+	pl, outcome := kiloProviderLimits(providerID, label, pass, passErr, balance, balanceErr, nowMs)
 
-	outcome := kiloOutcomeFetched
-	if pl.Source == "none" {
-		outcome = kiloOutcomeFailed
-	}
-	saveKiloCache(kiloCacheEntry{
+	entry := kiloCacheEntry{
 		FetchedAtMs: nowMs,
 		AccountID:   credential.AccountID,
-		Outcome:     outcome,
+		Outcome:     kiloOutcomeFor(outcome),
 		Limits:      &pl,
-	})
+	}
+	if outcome == kiloPassFailed {
+		// The attempt is recorded, the reading is not. A blip at the endpoint
+		// says nothing about whether the account still has its Pass, so the
+		// last good snapshot stays exactly as it was.
+		if previous.AccountID == credential.AccountID && previous.Limits != nil {
+			entry.Limits = previous.Limits
+		}
+	}
+	saveKiloCache(entry)
 	return pl
 }
 
-func kiloProviderLimits(providerID, label string, pass *KiloPassState, passErr error, balance *KiloBalance, balanceErr error, nowMs int64) ProviderLimits {
+func kiloOutcomeFor(outcome kiloPassOutcome) kiloCacheOutcome {
+	if outcome == kiloPassFailed {
+		return kiloOutcomeFailed
+	}
+	return kiloOutcomeFetched
+}
+
+func kiloProviderLimits(providerID, label string, pass *KiloPassState, passErr error, balance *KiloBalance, balanceErr error, nowMs int64) (ProviderLimits, kiloPassOutcome) {
 	pl := ProviderLimits{
 		ProviderID:  providerID,
 		Label:       label,
@@ -149,12 +184,23 @@ func kiloProviderLimits(providerID, label string, pass *KiloPassState, passErr e
 	}
 
 	// Exactly one half of the ratio is a half-reported period, not an account
-	// without a plan: the server named the plan but not a ratio this can use.
+	// without a plan: the server named the plan but not a ratio this can use,
+	// and did not say the plan ended.
 	if pass != nil && pass.HasAllowanceParts != pass.HasUsageParts {
 		pl.Source = "none"
 		pl.Note = kiloAccountNote(balance, balanceErr, strPtr(
 			"Kilo Pass reported only part of this period's credit allowance, which cannot be turned into a percentage"))
-		return pl
+		return pl, kiloPassFailed
+	}
+
+	// The status gates the ratio, so it is checked first. A cancelled or unpaid
+	// plan keeps reporting the amounts it last had, and metering those would
+	// leave a window on screen for a plan that is no longer paying.
+	if pass != nil && pass.Status != "" && !kiloPassLiveStatuses[pass.Status] {
+		pl.Source = "none"
+		pl.Note = kiloAccountNote(balance, balanceErr,
+			strPtr("Kilo Pass is "+pass.Status+" — nothing left to meter"))
+		return pl, kiloPassNoPass
 	}
 
 	if pass != nil && pass.HasAllowanceParts && pass.HasUsageParts {
@@ -164,32 +210,33 @@ func kiloProviderLimits(providerID, label string, pass *KiloPassState, passErr e
 			plan := "Kilo Pass · monthly credits"
 			pl.PlanType = &plan
 			pl.Note = kiloAccountNote(balance, balanceErr, nil)
-			return pl
+			return pl, kiloPassAllowance
 		}
-		// The response named a plan but not a usable ratio. Dropping the window
-		// is the honest outcome.
+		// The response named a plan but not a usable ratio. It does not say the
+		// account lost its Pass, so it is a failure, not a clearing answer:
+		// whatever this account had stays.
+		pl.Source = "none"
 		pl.Note = kiloAccountNote(balance, balanceErr,
 			strPtr("Kilo Pass reported no usable credit allowance for this period"))
-		return pl
+		return pl, kiloPassFailed
 	}
 
 	switch {
 	case passErr != nil:
+		// A request that failed says nothing about the account.
 		pl.Source = "none"
 		pl.Note = kiloAccountNote(balance, balanceErr,
 			strPtr("Kilo Pass allowance could not be read: "+passErr.Error()))
-	case pass != nil && pass.Status != "" && !kiloPassLiveStatuses[pass.Status]:
-		pl.Source = "none"
-		pl.Note = kiloAccountNote(balance, balanceErr,
-			strPtr("Kilo Pass is "+pass.Status+" — nothing left to meter"))
+		return pl, kiloPassFailed
 	default:
 		// subscription: null. The account pays from a shared credit balance
-		// rather than a plan. A normal state, not a failure.
+		// rather than a plan. A normal state, not a failure, and it clears any
+		// window this account had.
 		pl.Source = "kilo balance"
 		pl.Note = kiloAccountNote(balance, balanceErr, strPtr(
 			"no Kilo Pass — this account pays from a shared credit balance, which Kilo reports without a limit, so there is no quota percentage to show"))
+		return pl, kiloPassNoPass
 	}
-	return pl
 }
 
 // kiloMonthlyWindow converts a Kilo Pass period into the one window this

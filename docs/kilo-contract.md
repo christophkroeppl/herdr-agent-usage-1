@@ -82,7 +82,15 @@ to a constant 100% on a drained account and would read as "quota exhausted",
 which would be false.
 
 `subscription: null` and a status outside the live set both degrade to that
-state rather than to an error the user has to read.
+state rather than to an error the user has to read — and both are answers, not
+failures, so both **clear** a window this account had. A cancelled plan keeps
+reporting the amounts it last had, so the status is checked before the ratio.
+
+The two failure kinds are kept apart deliberately. A request that fails —
+transport, auth, server, decode — saves nothing, so the last good reading for
+that account survives: a blip is not evidence that the plan ended. The same
+holds for a response that names a plan but not a usable ratio, which does not
+say the account lost its Pass either.
 
 ### Deliberately not collected
 

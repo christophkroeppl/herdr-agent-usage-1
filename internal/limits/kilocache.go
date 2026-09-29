@@ -65,16 +65,16 @@ func kiloCacheFresh(entry kiloCacheEntry, accountID string, nowMs int64) bool {
 	return nowMs-entry.FetchedAtMs < kiloCacheTTL(entry.Outcome)
 }
 
-func loadKiloCache(nowMs int64, accountID string) (kiloCacheEntry, bool) {
+// readKiloCache returns whatever is on disk, fresh or not. The collector needs
+// the expired entry as well: a failed fetch records itself here without
+// touching the snapshot it did not disprove.
+func readKiloCache() (kiloCacheEntry, bool) {
 	raw, err := os.ReadFile(kiloCachePath())
 	if err != nil {
 		return kiloCacheEntry{}, false
 	}
 	var entry kiloCacheEntry
 	if err := json.Unmarshal(raw, &entry); err != nil {
-		return kiloCacheEntry{}, false
-	}
-	if !kiloCacheFresh(entry, accountID, nowMs) {
 		return kiloCacheEntry{}, false
 	}
 	return entry, true

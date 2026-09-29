@@ -11,6 +11,7 @@
 package limits
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,13 +25,44 @@ const nowMs int64 = 1_787_000_000_000
 // kiloStore writes a Kilo auth.json holding one gateway device login.
 func kiloStore(t *testing.T, access string) string {
 	t.Helper()
-	dir := t.TempDir()
+	return writeKiloAuth(t, t.TempDir(), access)
+}
+
+// writeKiloAuth writes the credential store for one gateway device login into
+// dir, so a test can drive the same path twice for the same account.
+func writeKiloAuth(t *testing.T, dir, access string) string {
+	t.Helper()
 	path := filepath.Join(dir, "auth.json")
 	raw := `{"kilo":{"type":"oauth","refresh":"rt","access":"` + access + `"},"opencode-go":{"type":"api","key":"og"}}`
 	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// credentialID is the identity the collector stamps a cached reading with.
+func credentialID(t *testing.T, authPath string) string {
+	t.Helper()
+	credential := kilo.GatewayLogin(authPath)
+	if credential == nil {
+		t.Fatalf("no gateway login at %s", authPath)
+	}
+	return credential.AccountID
+}
+
+// readCachedMonth is the monthly window a later read of the cache would serve
+// for this account, and nil when there is none.
+func readCachedMonth(t *testing.T, path, accountID string) *float64 {
+	t.Helper()
+	entry, ok := readKiloCache()
+	if !ok {
+		t.Fatalf("no cache at %s", path)
+	}
+	if entry.AccountID != accountID || entry.Limits == nil || entry.Limits.Tertiary == nil {
+		return nil
+	}
+	month := entry.Limits.Tertiary.UsedPercentage
+	return &month
 }
 
 // collect runs the collector against pinned fetchers and an isolated cache.
@@ -349,3 +381,139 @@ var errTest = &testError{}
 type testError struct{}
 
 func (*testError) Error() string { return "network unreachable" }
+
+// The regressions for the two directions of the clearing rule.
+//
+// Kilo upstream reads a null subscription and a non-live status as "no
+// consumable Pass" rather than as a failed request. Treating those as fetch
+// failures left the previous window on screen for the same account. Treating a
+// genuine failure as an answer destroys that same window over one 500. Both
+// need pinning, and neither may be pinned by a test that shares state with the
+// one beside it.
+
+// kiloFixture is one account's store, cache and clock.
+type kiloFixture struct {
+	dir     string
+	path    string
+	auth    string
+	account string
+	at      int64
+}
+
+func newKiloFixture(t *testing.T) *kiloFixture {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "kilo-pass.json")
+	t.Setenv("USAGEBAR_KILO_CACHE_PATH", path)
+	auth := writeKiloAuth(t, dir, "tok")
+	return &kiloFixture{dir: dir, path: path, auth: auth, account: credentialID(t, auth), at: nowMs}
+}
+
+// collect advances past the cache TTL so the API is really asked, and returns
+// what the caller was handed.
+func (f *kiloFixture) collect(t *testing.T, pass *KiloPassState, failure error) ProviderLimits {
+	t.Helper()
+	f.at += kiloCacheFailureTTLMs + 1
+	return CollectKiloLimits(f.at, CollectKiloLimitsOptions{
+		AuthPath: f.auth,
+		FetchBalance: func(string) (*KiloBalance, error) {
+			return &KiloBalance{Balance: 9}, nil
+		},
+		FetchPass: func(string) (*KiloPassState, error) {
+			if failure != nil {
+				return nil, failure
+			}
+			return pass, nil
+		},
+	})
+}
+
+// cached is the monthly window a later read of the cache would serve.
+func (f *kiloFixture) cached(t *testing.T) *float64 {
+	t.Helper()
+	return readCachedMonth(t, f.path, f.account)
+}
+
+func TestCollectKiloLimits_ClearsAStaleWindowWhenTheApiSaysThereIsNoPass(t *testing.T) {
+	noPass := map[string]*KiloPassState{"subscription null": {}}
+	for _, status := range []string{"canceled", "unpaid", "incomplete"} {
+		stopped := subscribed()
+		stopped.Status = status
+		noPass[status] = stopped
+	}
+	for name, state := range noPass {
+		t.Run(name, func(t *testing.T) {
+			f := newKiloFixture(t)
+			if got := f.collect(t, subscribed(), nil); got.Tertiary == nil {
+				t.Fatalf("setup: no window to start from: %+v", got)
+			}
+			if f.cached(t) == nil {
+				t.Fatal("setup: window was not cached")
+			}
+
+			got := f.collect(t, state, nil)
+			if got.Tertiary != nil {
+				t.Fatalf("the reading kept a window: %+v", got.Tertiary)
+			}
+			if month := f.cached(t); month != nil {
+				t.Fatalf("the cached 30d outlived the plan that produced it: %v", *month)
+			}
+		})
+	}
+}
+
+func TestCollectKiloLimits_AFailedRequestPreservesTheLastGoodReading(t *testing.T) {
+	failures := map[string]error{
+		"http 500":      errors.New("HTTP 500"),
+		"http 429":      errors.New("HTTP 429"),
+		"transport":     errors.New("connection refused"),
+		"decode":        errors.New("malformed JSON response"),
+		"half reported": errors.New("Kilo Pass reported no usable credit allowance for this period"),
+	}
+	for name, failure := range failures {
+		t.Run(name, func(t *testing.T) {
+			f := newKiloFixture(t)
+			if got := f.collect(t, subscribed(), nil); got.Tertiary == nil {
+				t.Fatalf("setup: %+v", got)
+			}
+
+			got := f.collect(t, nil, failure)
+			// The caller is told the fetch failed…
+			if got.Source != "none" {
+				t.Fatalf("source = %q, want none", got.Source)
+			}
+			// …but the cache still holds the reading the failure did not
+			// disprove.
+			if month := f.cached(t); month == nil {
+				t.Fatal("a failed request destroyed the last good reading")
+			}
+		})
+	}
+}
+
+func TestCollectKiloLimits_ANewAccountNeverInheritsAPreservedReading(t *testing.T) {
+	// One shared cache file, two distinct credential stores: the preserved
+	// snapshot is carried forward only for the login it was measured under.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "kilo-pass.json")
+	t.Setenv("USAGEBAR_KILO_CACHE_PATH", path)
+	first := writeKiloAuth(t, t.TempDir(), "tok_first")
+	second := writeKiloAuth(t, t.TempDir(), "tok_second")
+	balance := func(string) (*KiloBalance, error) { return &KiloBalance{Balance: 9}, nil }
+
+	if got := CollectKiloLimits(nowMs, CollectKiloLimitsOptions{
+		AuthPath: first, FetchBalance: balance,
+		FetchPass: func(string) (*KiloPassState, error) { return subscribed(), nil },
+	}); got.Tertiary == nil {
+		t.Fatalf("setup: %+v", got)
+	}
+
+	// The second account's fetch fails, so nothing of the first's survives.
+	CollectKiloLimits(nowMs+kiloCacheFailureTTLMs+1, CollectKiloLimitsOptions{
+		AuthPath: second, FetchBalance: balance,
+		FetchPass: func(string) (*KiloPassState, error) { return nil, errors.New("HTTP 500") },
+	})
+	if month := readCachedMonth(t, path, credentialID(t, second)); month != nil {
+		t.Fatalf("another account's reading leaked: %v", *month)
+	}
+}
