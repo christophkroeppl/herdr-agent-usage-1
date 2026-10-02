@@ -15,6 +15,13 @@ const storeWithBothKinds = `{
 	"openrouter": {"type":"api"}
 }`
 
+// The same login with a team selected. Kilo files the selected organization in
+// the login's accountId, and that scope decides whose wallet is read.
+const storeScopedToATeam = `{
+	"kilo": {"type":"oauth","refresh":"rt_secret","access":"st_access","accountId":"team_9f2"},
+	"opencode-go": {"type":"api","key":"og_secret"}
+}`
+
 func TestCredentialType_ReportsTheKindOnly(t *testing.T) {
 	auth := ParseAuthJSON([]byte(storeWithBothKinds))
 	if got := CredentialTypeIn(auth, "kilo"); got != "oauth" {
@@ -50,7 +57,7 @@ func TestGatewayLogin_AcceptsOnlyTheDeviceLogin(t *testing.T) {
 	} {
 		auth := ParseAuthJSON([]byte(store))
 		if got := GatewayLoginIn(auth); got != nil {
-			t.Fatalf("%s: accepted a credential it must refuse: %+v", name, got.AccountID)
+			t.Fatalf("%s: accepted a credential it must refuse: %+v", name, got.Identity)
 		}
 	}
 }
@@ -66,8 +73,45 @@ func TestGatewayLogin_ReadsTheDeviceLoginAndStampsAnIdentity(t *testing.T) {
 	}
 	// The identity is a hash, so it can key a cache without the token ever
 	// reaching disk.
-	if got.AccountID == "" || got.AccountID == got.Access {
-		t.Fatalf("account identity is not an opaque hash: %q", got.AccountID)
+	if got.Identity == "" || got.Identity == got.Access {
+		t.Fatalf("account identity is not an opaque hash: %q", got.Identity)
+	}
+	// No accountId means personal scope, which is the scope a Kilo Pass belongs
+	// to. A reader that treated the blank as a named organization would refuse
+	// every personal login.
+	if got.OrganizationID != "" {
+		t.Fatalf("organization = %q, want none for a personal-scope login", got.OrganizationID)
+	}
+}
+
+func TestGatewayLogin_CarriesTheSelectedOrganization(t *testing.T) {
+	// A team-billed pane fetches that team's wallet, so the scope has to survive
+	// the credential read rather than being re-guessed at the call site.
+	got := GatewayLoginIn(ParseAuthJSON([]byte(storeScopedToATeam)))
+	if got == nil {
+		t.Fatal("team-scoped device login was refused")
+	}
+	if got.OrganizationID != "team_9f2" {
+		t.Fatalf("organization = %q", got.OrganizationID)
+	}
+	if got.Identity == AccountIDForToken(got.Access, "") {
+		t.Fatal("an organization-scoped login shares the personal scope's identity")
+	}
+}
+
+func TestGatewayLogin_DifferentOrganizationsGetDifferentIdentities(t *testing.T) {
+	// Switching teams keeps the same token. Keying the cache on the token alone
+	// would serve the previous organization's window for the new one.
+	first := GatewayLoginIn(ParseAuthJSON([]byte(`{"kilo":{"type":"oauth","access":"tok","accountId":"team_a"}}`)))
+	second := GatewayLoginIn(ParseAuthJSON([]byte(`{"kilo":{"type":"oauth","access":"tok","accountId":"team_b"}}`)))
+	if first == nil || second == nil {
+		t.Fatal("expected both scopes to resolve")
+	}
+	if first.Identity == second.Identity {
+		t.Fatalf("two organizations share one identity: %q", first.Identity)
+	}
+	if first.Identity != AccountIDForToken("tok", "team_a") {
+		t.Fatalf("identity is not stable for one scope: %q", first.Identity)
 	}
 }
 
@@ -79,11 +123,11 @@ func TestGatewayLogin_DifferentLoginsGetDifferentIdentities(t *testing.T) {
 	if first == nil || second == nil {
 		t.Fatal("expected both logins to resolve")
 	}
-	if first.AccountID == second.AccountID {
-		t.Fatalf("two logins share one identity: %q", first.AccountID)
+	if first.Identity == second.Identity {
+		t.Fatalf("two logins share one identity: %q", first.Identity)
 	}
-	if first.AccountID != AccountIDForToken("tok_a") {
-		t.Fatalf("identity is not stable for one login: %q", first.AccountID)
+	if first.Identity != AccountIDForToken("tok_a", "") {
+		t.Fatalf("identity is not stable for one login: %q", first.Identity)
 	}
 }
 

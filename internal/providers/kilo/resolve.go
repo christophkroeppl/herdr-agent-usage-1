@@ -15,6 +15,7 @@ package kilo
 
 import (
 	"database/sql"
+	"path/filepath"
 	"strings"
 
 	"github.com/senna-lang/herdr-agent-usage/internal/core"
@@ -26,14 +27,20 @@ import (
 // was compacted or truncated still resolves from an earlier one.
 const stepScanLimit = 24
 
+// stepQuery reads the tail of a session's step-finish rows. The owning message
+// id is selected alongside the payload because that message — not the session's
+// newest assistant message — is what names the model this step was served by.
 const stepQuery = `
-	SELECT p.data
+	SELECT p.data, COALESCE(p.message_id, '')
 	FROM part p
 	WHERE p.session_id = ?
 	  AND json_extract(p.data, '$.type') = 'step-finish'
 	ORDER BY p.time_created DESC
 	LIMIT ?`
 
+// identityQuery names the backend a session currently runs on. This is the
+// pane's *live* backend, so "newest assistant message in the session" is the
+// right question here.
 const identityQuery = `
 	SELECT m.data
 	FROM message m
@@ -43,9 +50,38 @@ const identityQuery = `
 	ORDER BY m.time_created DESC
 	LIMIT 1`
 
+// partIdentityQuery names the backend of one specific step, by the message that
+// owns it. Keying on the message id rather than the session is what keeps a
+// completed step paired with the model that actually produced it.
+const partIdentityQuery = `
+	SELECT m.data
+	FROM message m
+	WHERE m.id = ?
+	  AND json_valid(m.data)
+	LIMIT 1`
+
+// directoryScopeQuery lists the live sessions a pane working in one directory
+// could be using: that directory itself, or anything beneath it, which is how a
+// worktree checked out under the repository is covered.
+//
+// It deliberately reads two rows. The caller has to be able to tell an
+// unambiguous match from a shared one, which a LIMIT 1 newest-first query
+// cannot: two panes in one repository share a cwd, and after one of them resets
+// its session the newest row belongs to the other pane.
+//
+// The child arm is separator-bounded and carries an ESCAPE clause, so /repo
+// never reaches /repo-other and a directory containing "_" or "%" is a literal
+// rather than a wildcard.
+const directoryScopeQuery = `
+	SELECT id FROM session
+	WHERE time_archived IS NULL
+	  AND (directory = ? OR directory LIKE ? ESCAPE '\')
+	ORDER BY time_updated DESC
+	LIMIT 2`
+
 const summaryQuery = `
 	SELECT cost, tokens_input, tokens_output, tokens_reasoning,
-	       tokens_cache_read, tokens_cache_write, model
+	       tokens_cache_read, tokens_cache_write, COALESCE(model, '')
 	FROM session
 	WHERE id = ?
 	LIMIT 1`
@@ -54,13 +90,7 @@ func openReadonlyDB(path string) (*sql.DB, error) {
 	return sql.Open("sqlite", "file:"+path+"?mode=ro")
 }
 
-// ResolveUsageForKilo resolves context usage from a session id, falling back to
-// the pane's cwd only when the reported id no longer resolves.
-//
-// The cwd fallback is the last step, not the first: two Kilo panes in one
-// repository share a cwd, so matching a session by directory alone would let
-// them cross-attribute. It runs only when the id herdr reported is gone, which
-// is the one case where nothing better exists.
+// ResolveUsageForKilo resolves context usage from a pane's session.
 func ResolveUsageForKilo(sessionID, cwd *string) *core.ContextUsage {
 	dbPath := ResolveKiloDBPath()
 	if dbPath == "" {
@@ -86,50 +116,24 @@ func resolveUsageIn(dbPath string, sessionID, cwd *string) *core.ContextUsage {
 	}
 	defer db.Close()
 
-	id := ""
-	if sessionID != nil {
-		id = strings.TrimSpace(*sessionID)
-	}
-	// An empty cwd is no identifier at all, and must not reach the fallback:
-	// the directory match is a LIKE, so an empty prefix would match every
-	// session in the store.
-	directory := ""
-	if cwd != nil {
-		directory = strings.TrimSpace(*cwd)
-	}
-	if id == "" {
-		if directory == "" {
-			return nil
-		}
-		id = resolveSessionIDByCwd(db, directory)
-	}
+	id := resolveSessionIDIn(db, sessionID, cwd)
 	if id == "" {
 		return nil
 	}
 
-	var found int
-	if err := db.QueryRow(`SELECT 1 AS ok FROM session WHERE id = ? LIMIT 1`, id).Scan(&found); err != nil {
-		// Herdr captures the session id at launch and never refreshes it, so a
-		// cleared or resumed session reports an id that no longer exists.
-		// Recovering by cwd is honest here because there is nothing to cross
-		// against; the first attempt was pane-scoped and has already failed.
-		if directory == "" {
-			return nil
-		}
-		id = resolveSessionIDByCwd(db, directory)
-		if id == "" {
-			return nil
-		}
-	}
-
-	step := latestStepUsage(db, id)
-	if step == nil {
+	row := latestStepRow(db, id)
+	if row == nil {
 		return nil
 	}
-	if step.ProviderID == "" {
+	step := row.Usage
+	if step.ProviderID == "" && row.MessageID != "" {
 		// Only 88 of Kilo's 9140 step rows carry their own model block, so the
-		// identity almost always comes from the assistant message.
-		if identity := latestMessageIdentity(db, id); identity.ProviderID != "" {
+		// identity almost always comes from a message. It must be the message
+		// that owns *this* step: after a model switch the newest assistant
+		// message can belong to a call that has not completed yet, and pairing
+		// this step's tokens with that message's model would divide one model's
+		// context by another model's window.
+		if identity := messageIdentityForPart(db, row.MessageID); identity.ProviderID != "" {
 			step.ProviderID = identity.ProviderID
 			if step.ModelID == "" {
 				step.ModelID = identity.ModelID
@@ -148,46 +152,119 @@ func resolveUsageIn(dbPath string, sessionID, cwd *string) *core.ContextUsage {
 	return &usage
 }
 
-func resolveSessionIDByCwd(db *sql.DB, cwd string) string {
-	var id string
-	// Exact directory first, then a child worktree of it. Archived sessions are
-	// excluded: an archived session's context is not what a live pane is using.
-	if err := db.QueryRow(
-		`SELECT id FROM session
-		 WHERE directory = ? AND time_archived IS NULL
-		 ORDER BY time_updated DESC LIMIT 1`, cwd).Scan(&id); err == nil && id != "" {
-		return id
+// resolveSessionIDIn takes the reported session id when it still resolves, and
+// otherwise falls back to the pane's directory.
+//
+// It is the single place a pane's session is chosen, and context, billing mode
+// and pane activity all go through it, so a pane's context, backend and spend
+// can never come from three different sessions.
+//
+// Herdr captures the session id at launch and never refreshes it, so a cleared
+// or resumed session reports an id that no longer exists. The directory is a
+// fallback, never a first choice: two Kilo panes in one repository share a cwd,
+// so the directory only names a session when it leaves no room for doubt.
+func resolveSessionIDIn(db *sql.DB, sessionID, cwd *string) string {
+	id := ""
+	if sessionID != nil {
+		id = strings.TrimSpace(*sessionID)
 	}
-	if err := db.QueryRow(
-		`SELECT id FROM session
-		 WHERE directory LIKE ? AND time_archived IS NULL
-		 ORDER BY time_updated DESC LIMIT 1`, escapeLike(cwd)+"%").Scan(&id); err == nil {
-		return id
+	if id != "" {
+		var found int
+		if err := db.QueryRow(`SELECT 1 AS ok FROM session WHERE id = ? LIMIT 1`, id).Scan(&found); err == nil {
+			return id
+		}
+	}
+	// An empty cwd is no identifier at all, and must not reach the fallback.
+	if cwd == nil {
+		return ""
+	}
+	return resolveSessionIDByCwd(db, *cwd)
+}
+
+// resolveSessionIDByCwd returns the one live session a pane working in cwd can
+// be attributed to, and "" whenever attribution cannot be established.
+//
+// Two live Kilo panes in one repository share a cwd, so "the newest session in
+// this directory" is not evidence of which pane asked: once one pane resets its
+// session, the newest row is the other pane's, and the recovered pane would
+// report another pane's context and backend. A directory therefore attributes a
+// session only when exactly one live session is in scope. Ambiguity yields no
+// reading rather than a confidently wrong one.
+func resolveSessionIDByCwd(db *sql.DB, cwd string) string {
+	directory := normalizeDirectory(cwd)
+	if directory == "" {
+		return ""
+	}
+	separator := string(filepath.Separator)
+	rows, err := db.Query(directoryScopeQuery, directory, escapeLike(directory+separator)+"%")
+	if err != nil {
+		return ""
+	}
+	defer rows.Close()
+	found := ""
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			continue
+		}
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if found != "" {
+			// Two panes could own these sessions; neither may claim the
+			// other's, so neither gets a reading.
+			return ""
+		}
+		found = id
+	}
+	return found
+}
+
+// normalizeDirectory reduces a pane cwd to the absolute directory form Kilo
+// records, so a trailing separator or a "." segment cannot turn one directory
+// into two spellings that each match differently.
+func normalizeDirectory(cwd string) string {
+	trimmed := strings.TrimSpace(cwd)
+	if trimmed == "" {
+		return ""
+	}
+	// A relative "." names no directory Kilo could have recorded.
+	if cleaned := filepath.Clean(trimmed); cleaned != "." {
+		return cleaned
 	}
 	return ""
 }
 
 // escapeLike neutralises the wildcards in a directory path before it is used in
-// a LIKE comparison, so a repo checked out under a directory containing "_"
-// cannot match an unrelated session.
+// a LIKE comparison, so a repo checked out under a directory containing "_" or
+// "%" cannot match an unrelated session. It requires the ESCAPE clause that
+// directoryScopeQuery carries: SQLite's LIKE has no implicit backslash escape.
 func escapeLike(value string) string {
 	replacer := strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_")
 	return replacer.Replace(value)
 }
 
-func latestStepUsage(db *sql.DB, sessionID string) *StepUsage {
+// stepRow is one scanned part row: the decoded usage, plus the id of the
+// message that owns the step.
+type stepRow struct {
+	Usage     *StepUsage
+	MessageID string
+}
+
+func latestStepRow(db *sql.DB, sessionID string) *stepRow {
 	rows, err := db.Query(stepQuery, sessionID, stepScanLimit)
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var raw string
-		if err := rows.Scan(&raw); err != nil {
+		var raw, messageID string
+		if err := rows.Scan(&raw, &messageID); err != nil {
 			continue
 		}
 		if usage := ParseStepUsage(raw); usage != nil {
-			return usage
+			return &stepRow{Usage: usage, MessageID: strings.TrimSpace(messageID)}
 		}
 	}
 	return nil
@@ -209,6 +286,15 @@ func latestMessageIdentity(db *sql.DB, sessionID string) MessageIdentity {
 	return MessageIdentity{}
 }
 
+// messageIdentityForPart reads the identity of the message that owns one step.
+func messageIdentityForPart(db *sql.DB, messageID string) MessageIdentity {
+	var raw string
+	if err := db.QueryRow(partIdentityQuery, messageID).Scan(&raw); err != nil {
+		return MessageIdentity{}
+	}
+	return ParseMessageIdentity(raw)
+}
+
 // sessionCache sums the prompt-cache counters across the scanned step tail.
 // Only the steps actually read are counted, so the figure is a bounded sample
 // of the transcript rather than a claim about the whole session; the latest
@@ -221,8 +307,8 @@ func sessionCache(db *sql.DB, sessionID string, newest *StepUsage) *core.CacheUs
 	defer rows.Close()
 	fresh, read, write := 0, 0, 0
 	for rows.Next() {
-		var raw string
-		if err := rows.Scan(&raw); err != nil {
+		var raw, messageID string
+		if err := rows.Scan(&raw, &messageID); err != nil {
 			continue
 		}
 		if usage := ParseStepUsage(raw); usage != nil {
@@ -241,7 +327,7 @@ func sessionCache(db *sql.DB, sessionID string, newest *StepUsage) *core.CacheUs
 // lifetime session totals, not a window: use them for pane activity and cost
 // labels, never for a context percentage.
 func SessionSummaryForKilo(sessionID *string) (SessionSummary, bool) {
-	if sessionID == nil || *sessionID == "" {
+	if sessionID == nil || strings.TrimSpace(*sessionID) == "" {
 		return SessionSummary{}, false
 	}
 	dbPath := ResolveKiloDBPath()
@@ -251,13 +337,39 @@ func SessionSummaryForKilo(sessionID *string) (SessionSummary, bool) {
 	return sessionSummaryIn(dbPath, *sessionID)
 }
 
+// SessionActivityForKilo names the pane's session and reads its totals in one
+// open of the store.
+//
+// The pane's cwd is part of the signature so the caller cannot accidentally read
+// a session the pane's context is not coming from: a pane whose reported id no
+// longer resolves still reports the session its context resolves to.
+func SessionActivityForKilo(sessionID, cwd *string) (SessionSummary, bool) {
+	dbPath := ResolveKiloDBPath()
+	if dbPath == "" {
+		return SessionSummary{}, false
+	}
+	db, err := openReadonlyDB(dbPath)
+	if err != nil {
+		return SessionSummary{}, false
+	}
+	defer db.Close()
+	id := resolveSessionIDIn(db, sessionID, cwd)
+	if id == "" {
+		return SessionSummary{}, false
+	}
+	return sessionSummary(db, id)
+}
+
 func sessionSummaryIn(dbPath, sessionID string) (SessionSummary, bool) {
 	db, err := openReadonlyDB(dbPath)
 	if err != nil {
 		return SessionSummary{}, false
 	}
 	defer db.Close()
+	return sessionSummary(db, sessionID)
+}
 
+func sessionSummary(db *sql.DB, sessionID string) (SessionSummary, bool) {
 	var (
 		cost                                  float64
 		input, output, reasoning, read, write int
@@ -270,15 +382,15 @@ func sessionSummaryIn(dbPath, sessionID string) (SessionSummary, bool) {
 	return SessionSummaryFromRow(cost, input, output, reasoning, read, write, modelJSON), true
 }
 
-// BackendForKilo reports which backend a session's model was served by.
+// BackendForKilo reports which backend served a pane's session.
 //
-// Kilo drives several providers, so the backend is what decides whether a pane
-// owns a Kilo allowance at all. It comes from the assistant message rather
-// than session.model, which Kilo only populates on newer sessions.
-func BackendForKilo(sessionID *string) string {
-	if sessionID == nil || *sessionID == "" {
-		return ""
-	}
+// The pane's session is resolved exactly as context resolution resolves it, so
+// a pane whose reported id is gone is still classified by the session its
+// context comes from. Resolving the id separately here would leave that pane
+// displaying a Kilo context while its billing mode saw no backend at all, which
+// is how a foreign API-key session ends up showing alongside a Kilo allowance
+// instead of as pay-as-you-go.
+func BackendForKilo(sessionID, cwd *string) string {
 	dbPath := ResolveKiloDBPath()
 	if dbPath == "" {
 		return ""
@@ -288,5 +400,9 @@ func BackendForKilo(sessionID *string) string {
 		return ""
 	}
 	defer db.Close()
-	return latestMessageIdentity(db, *sessionID).ProviderID
+	id := resolveSessionIDIn(db, sessionID, cwd)
+	if id == "" {
+		return ""
+	}
+	return latestMessageIdentity(db, id).ProviderID
 }

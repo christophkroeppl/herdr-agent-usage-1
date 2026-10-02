@@ -706,9 +706,12 @@ func ompPiPaneBackendID(providerID string, pane OpenPaneSnapshot) string {
 // kiloPaneBackendID returns the backend Kilo served the pane's session with.
 //
 // Kilo drives several providers from one CLI, so this is what decides whether a
-// pane draws on a Kilo allowance or on someone else's login.
+// pane draws on a Kilo allowance or on someone else's login. The pane's cwd is
+// passed through because the session is resolved by the same rules the context
+// read uses: a pane whose reported id is gone must be classified by the session
+// its context comes from, not by nothing.
 func kiloPaneBackendID(pane OpenPaneSnapshot) string {
-	return kilo.BackendForKilo(pane.SessionID)
+	return kilo.BackendForKilo(pane.SessionID, pane.Cwd)
 }
 
 func ompPiSubscriptionRoute(providerID string, pane OpenPaneSnapshot) (SubscriptionRoute, bool) {

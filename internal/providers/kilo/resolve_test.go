@@ -37,15 +37,60 @@ const costOnlyStep = `{"type":"step-finish","tokens":{"total":0,"input":0,"outpu
  "cache":{"read":0,"write":0}},"cost":0}`
 
 // writeStore builds a Kilo session store with the given session rows.
-func writeStore(t *testing.T, steps []string, messages []string, sessionCols [6]int, modelJSON string) string {
+func writeStore(t *testing.T, steps []string, messages []string, sessionCols [6]int, modelJSON any) string {
 	t.Helper()
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "kilo.db")
+	db := openStoreDB(t, dbPath)
+	insertSession(t, db, "ses_test", "/repo", 1, modelJSON)
+	insertSessionTotals(t, db, "ses_test", sessionCols)
+	for i, data := range messages {
+		insertMessage(t, db, "msg_"+string(rune('a'+i)), "ses_test", int64(100-i), data)
+	}
+	for i, data := range steps {
+		insertPart(t, db, "prt_"+string(rune('a'+i)), "msg_a", "ses_test", int64(100-i), data)
+	}
+	closeStoreDB(t, db)
+	return dbPath
+}
+
+// writeSessions builds a store holding one live session per directory, each with
+// a step-finish part of its own. It is the fixture for everything that turns on
+// *which* session a pane may claim, where the sessions have to be told apart.
+func writeSessions(t *testing.T, directories ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "kilo.db")
+	db := openStoreDB(t, dbPath)
+	for i, directory := range directories {
+		id := "ses_" + string(rune('a'+i))
+		insertSession(t, db, id, directory, int64(i+1), "")
+		insertMessage(t, db, "msg_"+id, id, 1, assistantMessage)
+		insertPart(t, db, "prt_"+id, "msg_"+id, id, 1, stepWithModel)
+	}
+	closeStoreDB(t, db)
+	return dbPath
+}
+
+func openStoreDB(t *testing.T, dbPath string) *sql.DB {
+	t.Helper()
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	createStoreSchema(t, db)
+	return db
+}
+
+func closeStoreDB(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func createStoreSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
 	mustExec(t, db, `CREATE TABLE session (
 		id TEXT PRIMARY KEY, directory TEXT, time_updated INTEGER DEFAULT 0,
 		time_archived INTEGER, cost REAL DEFAULT 0 NOT NULL,
@@ -58,33 +103,46 @@ func writeStore(t *testing.T, steps []string, messages []string, sessionCols [6]
 		time_created INTEGER, data TEXT)`)
 	mustExec(t, db, `CREATE INDEX part_session_step_finish_idx ON part (session_id)
 		WHERE json_valid(part.data) AND json_extract(part.data,'$.type') = 'step-finish'`)
+}
 
-	cost := 0.5
-	_, err = db.Exec(`INSERT INTO session (id, directory, cost, tokens_input, tokens_output,
-		tokens_reasoning, tokens_cache_read, tokens_cache_write, model)
-		VALUES ('ses_test', ?, ?, ?, ?, ?, ?, ?, ?)`,
-		"/repo", cost, sessionCols[0], sessionCols[1], sessionCols[2], sessionCols[3], sessionCols[4], modelJSON)
+// insertSession writes one session row. A nil model writes SQL NULL, which is
+// what Kilo writes for a session whose model it never recorded.
+func insertSession(t *testing.T, db *sql.DB, id, directory string, timeUpdated int64, model any) {
+	t.Helper()
+	_, err := db.Exec(
+		`INSERT INTO session (id, directory, time_updated, model) VALUES (?, ?, ?, ?)`,
+		id, directory, timeUpdated, model)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i, data := range messages {
-		_, err := db.Exec(`INSERT INTO message (id, session_id, time_created, data) VALUES (?,?,?,?)`,
-			"msg_"+string(rune('a'+i)), "ses_test", 100-i, data)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	for i, data := range steps {
-		_, err := db.Exec(`INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?,?,?,?,?)`,
-			"prt_"+string(rune('a'+i)), "msg_a", "ses_test", 100-i, data)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := db.Close(); err != nil {
+}
+
+func insertSessionTotals(t *testing.T, db *sql.DB, id string, cols [6]int) {
+	t.Helper()
+	// cost, then the five token counters Kilo backfills from the messages.
+	_, err := db.Exec(
+		`UPDATE session SET cost = 0.5, tokens_input = ?, tokens_output = ?, tokens_reasoning = ?,
+		 tokens_cache_read = ?, tokens_cache_write = ? WHERE id = ?`,
+		cols[0], cols[1], cols[2], cols[3], cols[4], id)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return dbPath
+}
+
+func insertMessage(t *testing.T, db *sql.DB, id, sessionID string, created int64, data string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO message (id, session_id, time_created, data) VALUES (?,?,?,?)`,
+		id, sessionID, created, data); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertPart(t *testing.T, db *sql.DB, id, messageID, sessionID string, created int64, data string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?,?,?,?,?)`,
+		id, messageID, sessionID, created, data); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func mustExec(t *testing.T, db *sql.DB, query string) {
@@ -149,7 +207,7 @@ func TestResolveUsage_ModelComesFromTheMessageWhenTheStepHasNone(t *testing.T) {
 	if usage.WindowTokens != nil {
 		t.Fatalf("unknown model must yield no window, got %v", *usage.WindowTokens)
 	}
-	if backend := BackendForKilo(strPtr("ses_test")); backend != "kilo" {
+	if backend := BackendForKilo(strPtr("ses_test"), nil); backend != "kilo" {
 		t.Fatalf("backend = %q", backend)
 	}
 }
@@ -192,22 +250,88 @@ func TestResolveUsage_NoIdentifiersYieldsNothing(t *testing.T) {
 }
 
 func TestResolveUsage_TwoPanesInOneRepoDoNotCrossAttribute(t *testing.T) {
-	// Two Kilo panes in one repository share a cwd, so a session that cannot be
-	// resolved by id must not borrow the other pane's session by directory.
-	// Pinning the id is what keeps them apart.
-	dbPath := writeStore(t, []string{stepWithModel}, []string{assistantMessage}, [6]int{}, "")
+	// Two live Kilo panes in one repository share a cwd, so a pane whose
+	// reported id is gone must not borrow the other pane's session by directory.
+	// Once the id is stale the newest row in that directory is the other pane's,
+	// so recovering from it would report a confident, wrong reading — for
+	// context and for billing alike.
+	dbPath := writeSessions(t, "/repo", "/repo")
 	useStore(t, dbPath)
 
-	if usage := ResolveUsageForKilo(strPtr("ses_test"), nil); usage == nil {
+	// A pinned id is still its own session.
+	if usage := ResolveUsageForKilo(strPtr("ses_a"), nil); usage == nil {
 		t.Fatal("id-only resolution failed")
 	}
-	if usage := ResolveUsageForKilo(nil, strPtr("/repo")); usage == nil {
-		t.Fatal("cwd-only resolution failed for a single session")
+	// A directory holding two live sessions attributes nothing.
+	if usage := ResolveUsageForKilo(strPtr("ses_gone"), strPtr("/repo")); usage != nil {
+		t.Fatalf("an ambiguous directory attributed another pane's session: %+v", usage)
 	}
-	// A second session in the same directory must be the only candidate, so a
-	// pane pinned to a real id never resolves the other one.
-	if usage := ResolveUsageForKilo(strPtr("ses_absent"), strPtr("/repo")); usage == nil {
-		t.Fatal("recovery path failed")
+	if usage := ResolveUsageForKilo(nil, strPtr("/repo")); usage != nil {
+		t.Fatalf("an ambiguous directory attributed a session: %+v", usage)
+	}
+	if backend := BackendForKilo(strPtr("ses_gone"), strPtr("/repo")); backend != "" {
+		t.Fatalf("billing mode named a backend for an unattributable pane: %q", backend)
+	}
+}
+
+func TestResolveUsage_CwdFallbackStaysInsideTheDirectoryTree(t *testing.T) {
+	// The fallback reaches the directory and its descendants, which is how a
+	// worktree checked out under the repo is covered. A bare prefix would also
+	// reach siblings, so /repo must never answer for /repo-other; and without an
+	// ESCAPE clause SQLite reads "_" and "%" in a path as wildcards.
+	t.Setenv("KILO_MODELS_PATH", filepath.Join(t.TempDir(), "absent.json"))
+	ClearModelsCatalogCache()
+
+	t.Run("a descendant resolves", func(t *testing.T) {
+		useStore(t, writeSessions(t, "/repo/worktrees/wt"))
+		if usage := ResolveUsageForKilo(strPtr("ses_gone"), strPtr("/repo")); usage == nil {
+			t.Fatal("a worktree under the directory did not resolve")
+		}
+	})
+	t.Run("a sibling does not", func(t *testing.T) {
+		// Two stores, because the point is that /repo-other is out of scope for
+		// a pane in /repo: an in-scope /repo session must win, and with none,
+		// nothing may be invented from the sibling.
+		useStore(t, writeSessions(t, "/repo", "/repo-other"))
+		if usage := ResolveUsageForKilo(strPtr("ses_gone"), strPtr("/repo")); usage == nil {
+			t.Fatal("the session in the pane's own directory did not resolve")
+		}
+		useStore(t, writeSessions(t, "/repo-other"))
+		if usage := ResolveUsageForKilo(strPtr("ses_gone"), strPtr("/repo")); usage != nil {
+			t.Fatalf("a sibling directory resolved: %+v", usage)
+		}
+	})
+	t.Run("a wildcard in the path is a literal", func(t *testing.T) {
+		for _, directory := range []string{"/my_repo", "/100%done"} {
+			useStore(t, writeSessions(t, filepath.Join(directory, "nested")))
+			if usage := ResolveUsageForKilo(strPtr("ses_gone"), strPtr(directory)); usage == nil {
+				t.Fatalf("%s: a descendant of a wildcarded path did not resolve", directory)
+			}
+		}
+	})
+	t.Run("a wildcard in the path cannot invent a match", func(t *testing.T) {
+		// "/my_repo" must not stand in for "/myXrepo": the underscore is a path
+		// character here, not a single-character wildcard.
+		useStore(t, writeSessions(t, "/myXrepo"))
+		if usage := ResolveUsageForKilo(strPtr("ses_gone"), strPtr("/my_repo")); usage != nil {
+			t.Fatalf("an underscore was read as a wildcard: %+v", usage)
+		}
+	})
+}
+
+func TestBackendForKilo_RecoversTheSessionByDirectory(t *testing.T) {
+	// Billing mode and context must name the same session. When herdr's id has
+	// gone stale, a pane that shows a Kilo context but an empty backend would be
+	// classified as Unknown and could appear next to the Kilo allowance instead of
+	// as the pay-as-you-go session it is.
+	dbPath := writeSessions(t, "/repo")
+	useStore(t, dbPath)
+
+	if backend := BackendForKilo(strPtr("ses_gone"), strPtr("/repo")); backend != "kilo" {
+		t.Fatalf("backend = %q, want the recovered session's", backend)
+	}
+	if backend := BackendForKilo(strPtr("ses_gone"), nil); backend != "" {
+		t.Fatalf("a session that cannot be resolved produced a backend: %q", backend)
 	}
 }
 
@@ -265,6 +389,85 @@ func TestSessionSummary_EmptyModelColumnIsNormal(t *testing.T) {
 	}
 }
 
+func TestResolveUsage_ModelComesFromTheMessageThatOwnsTheStep(t *testing.T) {
+	// After a model switch the newest assistant message can belong to a call
+	// that has not completed a step yet. Reading the identity from the session's
+	// newest message would pair the previous model's tokens with the new model's
+	// window — a false low percentage, or an overflow.
+	models := filepath.Join(t.TempDir(), "models.json")
+	if err := os.WriteFile(models, []byte(
+		`{"kilo":{"models":{"~openai/gpt-mini-latest":{"limit":{"context":1000000}}}},
+		   "anthropic":{"models":{"claude-sonnet-5":{"limit":{"context":200000}}}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KILO_MODELS_PATH", models)
+	ClearModelsCatalogCache()
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "kilo.db")
+	db := openStoreDB(t, dbPath)
+	insertSession(t, db, "ses_test", "/repo", 1, "")
+	// The step belongs to the earlier message and was served by the earlier model.
+	insertMessage(t, db, "msg_a", "ses_test", 1, assistantMessage)
+	insertPart(t, db, "prt_a", "msg_a", "ses_test", 1, stepWithoutModel)
+	// A newer turn switched model and has not completed a step.
+	insertMessage(t, db, "msg_b", "ses_test", 2,
+		`{"role":"assistant","providerID":"anthropic","modelID":"claude-sonnet-5",
+		  "tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}`)
+	closeStoreDB(t, db)
+	useStore(t, dbPath)
+
+	usage := ResolveUsageForKilo(strPtr("ses_test"), strPtr("/repo"))
+	if usage == nil {
+		t.Fatal("no usage")
+	}
+	// The step's own model, not the pane's newest one.
+	if usage.WindowTokens == nil || *usage.WindowTokens != 1000000 {
+		t.Fatalf("window = %v, want the step's own model", usage.WindowTokens)
+	}
+	// Billing mode still follows the live session, which is the newer message.
+	if backend := BackendForKilo(strPtr("ses_test"), strPtr("/repo")); backend != "anthropic" {
+		t.Fatalf("live backend = %q, want the newest assistant message's", backend)
+	}
+}
+
+func TestSessionSummary_ToleratesANullModelColumn(t *testing.T) {
+	// session.model is populated on only some sessions, and an unwritten one is
+	// SQL NULL rather than an empty string. The read has to survive it: the
+	// totals beside it are the pane's spend.
+	dbPath := writeStore(t, []string{stepWithModel}, []string{assistantMessage}, [6]int{7, 0, 0, 20, 0}, nil)
+	useStore(t, dbPath)
+
+	summary, ok := SessionSummaryForKilo(strPtr("ses_test"))
+	if !ok {
+		t.Fatal("a NULL model column dropped the session's totals")
+	}
+	if summary.TotalTokens() != 27 {
+		t.Fatalf("total tokens = %d", summary.TotalTokens())
+	}
+	if summary.ProviderID != "" || summary.ModelID != "" {
+		t.Fatalf("identity invented: %+v", summary)
+	}
+}
+
+func TestSessionActivity_NamesThePanesOwnSession(t *testing.T) {
+	// Pane activity has to come from the same session the pane's context and
+	// billing mode do, or the sidebar sums one session while showing another's.
+	dbPath := writeSessions(t, "/repo")
+	useStore(t, dbPath)
+
+	summary, ok := SessionActivityForKilo(strPtr("ses_gone"), strPtr("/repo"))
+	if !ok {
+		t.Fatal("the recovered session reported no totals")
+	}
+	if summary.Cost != 0 {
+		t.Fatalf("cost = %v, want the fixture's zero", summary.Cost)
+	}
+	if _, ok := SessionActivityForKilo(strPtr("ses_gone"), nil); ok {
+		t.Fatal("an unresolvable pane reported session totals")
+	}
+}
+
 func TestQueriesAreBoundedAndReadOnly(t *testing.T) {
 	// A whole-table scan would be a bug: the store is a live WAL database with
 	// hundreds of thousands of rows.
@@ -278,6 +481,24 @@ func TestQueriesAreBoundedAndReadOnly(t *testing.T) {
 	}
 	if contains(stepQuery, "SUM(") {
 		t.Fatalf("step query aggregates instead of reading the newest row")
+	}
+	// The step's identity is read from one named message, so it is keyed on the
+	// primary key rather than on a session-wide "newest" scan.
+	if !contains(partIdentityQuery, "WHERE m.id = ?") || !contains(partIdentityQuery, "LIMIT 1") {
+		t.Fatalf("step identity is not keyed on one message: %s", partIdentityQuery)
+	}
+	// The directory fallback must stay bounded and must keep its two-row read:
+	// deciding whether a directory is shared needs to see that it is.
+	if !contains(directoryScopeQuery, "LIMIT 2") {
+		t.Fatalf("directory scope cannot detect ambiguity: %s", directoryScopeQuery)
+	}
+	if !contains(directoryScopeQuery, "ESCAPE") {
+		t.Fatalf("directory scope reads wildcards as path characters: %s", directoryScopeQuery)
+	}
+	// The scope is the directory plus a separator-bounded prefix, never a bare
+	// prefix, which would also match sibling directories.
+	if !contains(directoryScopeQuery, "directory = ?") || !contains(directoryScopeQuery, "directory LIKE ?") {
+		t.Fatalf("directory scope lost the exact match: %s", directoryScopeQuery)
 	}
 }
 

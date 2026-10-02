@@ -11,6 +11,7 @@
 package limits
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -47,7 +48,7 @@ func credentialID(t *testing.T, authPath string) string {
 	if credential == nil {
 		t.Fatalf("no gateway login at %s", authPath)
 	}
-	return credential.AccountID
+	return credential.Identity
 }
 
 // readCachedMonth is the monthly window a later read of the cache would serve
@@ -74,7 +75,7 @@ func collect(t *testing.T, authPath string, pass *KiloPassState, passErr error, 
 		FetchPass: func(string) (*KiloPassState, error) {
 			return pass, passErr
 		},
-		FetchBalance: func(string) (*KiloBalance, error) {
+		FetchBalance: func(string, string) (*KiloBalance, error) {
 			return balance, balanceErr
 		},
 	})
@@ -279,12 +280,12 @@ func TestCollectKiloLimits_TheCacheNeverServesAnotherAccountsReading(t *testing.
 	CollectKiloLimits(nowMs, CollectKiloLimitsOptions{
 		AuthPath:     first,
 		FetchPass:    func(string) (*KiloPassState, error) { return subscribed(), nil },
-		FetchBalance: func(string) (*KiloBalance, error) { return &KiloBalance{Balance: 9}, nil },
+		FetchBalance: func(string, string) (*KiloBalance, error) { return &KiloBalance{Balance: 9}, nil },
 	})
 	reused := CollectKiloLimits(nowMs+2000, CollectKiloLimitsOptions{
 		AuthPath:     first,
 		FetchPass:    func(string) (*KiloPassState, error) { t.Fatal("refetched a fresh entry"); return nil, nil },
-		FetchBalance: func(string) (*KiloBalance, error) { t.Fatal("refetched a fresh entry"); return nil, nil },
+		FetchBalance: func(string, string) (*KiloBalance, error) { t.Fatal("refetched a fresh entry"); return nil, nil },
 	})
 	if reused.Tertiary == nil {
 		t.Fatalf("fresh cache entry not reused: %+v", reused)
@@ -299,7 +300,7 @@ func TestCollectKiloLimits_TheCacheNeverServesAnotherAccountsReading(t *testing.
 			calls++
 			return &KiloPassState{}, nil
 		},
-		FetchBalance: func(string) (*KiloBalance, error) { return &KiloBalance{Balance: 1}, nil },
+		FetchBalance: func(string, string) (*KiloBalance, error) { return &KiloBalance{Balance: 1}, nil },
 	})
 	if calls == 0 {
 		t.Fatal("the second account was served the first account's cache entry")
@@ -319,7 +320,7 @@ func TestCollectKiloLimits_TheCachedFileNeverContainsTheCredential(t *testing.T)
 	CollectKiloLimits(nowMs, CollectKiloLimitsOptions{
 		AuthPath:     kiloStore(t, access),
 		FetchPass:    func(string) (*KiloPassState, error) { return subscribed(), nil },
-		FetchBalance: func(string) (*KiloBalance, error) { return &KiloBalance{Balance: 2}, nil },
+		FetchBalance: func(string, string) (*KiloBalance, error) { return &KiloBalance{Balance: 2}, nil },
 	})
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -334,7 +335,7 @@ func TestCollectKiloLimits_TheCachedFileNeverContainsTheCredential(t *testing.T)
 			t.Fatalf("cache file carries credential field %s: %s", field, body)
 		}
 	}
-	if !strings.Contains(body, kilo.CredentialID(access)) {
+	if !strings.Contains(body, kilo.AccountIDForToken(access, "")) {
 		t.Fatalf("cache file does not record the hashed identity: %s", body)
 	}
 	info, err := os.Stat(path)
@@ -414,9 +415,22 @@ func newKiloFixture(t *testing.T) *kiloFixture {
 func (f *kiloFixture) collect(t *testing.T, pass *KiloPassState, failure error) ProviderLimits {
 	t.Helper()
 	f.at += kiloCacheFailureTTLMs + 1
+	return f.collectAt(t, pass, failure)
+}
+
+// collectAgain re-reads inside the cache TTL, so what the caller gets is
+// whatever the cached entry replays rather than a fresh answer from the API.
+func (f *kiloFixture) collectAgain(t *testing.T, pass *KiloPassState, failure error) ProviderLimits {
+	t.Helper()
+	f.at += 1000
+	return f.collectAt(t, pass, failure)
+}
+
+func (f *kiloFixture) collectAt(t *testing.T, pass *KiloPassState, failure error) ProviderLimits {
+	t.Helper()
 	return CollectKiloLimits(f.at, CollectKiloLimitsOptions{
 		AuthPath: f.auth,
-		FetchBalance: func(string) (*KiloBalance, error) {
+		FetchBalance: func(string, string) (*KiloBalance, error) {
 			return &KiloBalance{Balance: 9}, nil
 		},
 		FetchPass: func(string) (*KiloPassState, error) {
@@ -491,6 +505,165 @@ func TestCollectKiloLimits_AFailedRequestPreservesTheLastGoodReading(t *testing.
 	}
 }
 
+func TestCollectKiloLimits_AFailedAttemptIsNotServedAsAFreshWindow(t *testing.T) {
+	// The preserved snapshot exists so a blip does not destroy the reading — not
+	// so a failed request can keep handing it out. Serving it on the next refresh
+	// put the previous period's window back on screen stamped with the failed
+	// attempt's time and none of its note, and repeated failures copied it
+	// forward indefinitely.
+	f := newKiloFixture(t)
+	if got := f.collect(t, subscribed(), nil); got.Tertiary == nil {
+		t.Fatalf("setup: %+v", got)
+	}
+
+	failing := f.collect(t, nil, errors.New("kilo rejected the gateway login (HTTP 401)"))
+	if failing.Tertiary != nil || failing.Source != "none" {
+		t.Fatalf("the failing call reported limits: %+v", failing)
+	}
+
+	// Inside the failure TTL the endpoint is not re-hit, and what comes back is
+	// the failure itself rather than the snapshot it preserved.
+	replayed := f.collectAgain(t, subscribed(), nil)
+	if replayed.Tertiary != nil {
+		t.Fatalf("a preserved snapshot was served as a new reading: %+v", replayed.Tertiary)
+	}
+	if replayed.Source != "none" {
+		t.Fatalf("source = %q, want none", replayed.Source)
+	}
+	if replayed.Note == nil || !strings.Contains(*replayed.Note, "could not be read") {
+		t.Fatalf("the failure note was dropped: %v", replayed.Note)
+	}
+	// What the failure did not disprove is still on disk to recover from.
+	if month := f.cached(t); month == nil {
+		t.Fatal("the last good reading was destroyed by the failure")
+	}
+}
+
+func TestCollectKiloLimits_ALegacyFailedEntryIsReReadRatherThanServed(t *testing.T) {
+	// An entry written before failures were stored apart carries the snapshot and
+	// nothing saying it failed. Re-reading costs one request; serving that
+	// snapshot would report an unmeasured window as if it were a fresh limit.
+	f := newKiloFixture(t)
+	if got := f.collect(t, subscribed(), nil); got.Tertiary == nil {
+		t.Fatalf("setup: %+v", got)
+	}
+	raw, err := os.ReadFile(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		t.Fatal(err)
+	}
+	delete(entry, "failure")
+	entry["outcome"] = "failed"
+	trimmed, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f.path, trimmed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	f.at += 1000
+	got := CollectKiloLimits(f.at, CollectKiloLimitsOptions{
+		AuthPath:     f.auth,
+		FetchBalance: func(string, string) (*KiloBalance, error) { return &KiloBalance{Balance: 9}, nil },
+		FetchPass: func(string) (*KiloPassState, error) {
+			calls++
+			return subscribed(), nil
+		},
+	})
+	if calls == 0 {
+		t.Fatal("a failed entry with no failure of its own was served from cache")
+	}
+	if got.Tertiary == nil {
+		t.Fatalf("the re-read produced no window: %+v", got)
+	}
+}
+
+func TestCollectKiloLimits_AnOrganizationLoginNeverGetsAPersonalPass(t *testing.T) {
+	// Kilo files the selected team in the login's accountId, and a Kilo Pass is
+	// personal scope: the CLI shows it for the signed-in person, never for a
+	// team. Billing to an organization has no monthly allowance to meter, and the
+	// person's Pass must not be put on that spend.
+	authPath := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(authPath, []byte(
+		`{"kilo":{"type":"oauth","refresh":"rt","access":"tok","accountId":"team_9f2"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("USAGEBAR_KILO_CACHE_PATH", filepath.Join(t.TempDir(), "kilo-cache.json"))
+
+	scope := ""
+	pl := CollectKiloLimits(nowMs, CollectKiloLimitsOptions{
+		AuthPath: authPath,
+		// The Pass this account does have is a complete, live one. It still must
+		// not be metered here, because it is not this scope's.
+		FetchPass: func(string) (*KiloPassState, error) { return subscribed(), nil },
+		FetchBalance: func(_, organizationID string) (*KiloBalance, error) {
+			scope = organizationID
+			return &KiloBalance{Balance: 7}, nil
+		},
+	})
+	if scope != "team_9f2" {
+		t.Fatalf("the balance was read for scope %q, want the selected team", scope)
+	}
+	for _, w := range []*LimitWindow{pl.Primary, pl.Secondary, pl.Tertiary} {
+		if w != nil {
+			t.Fatalf("a personal Pass was put on an organization's spend: %+v", w)
+		}
+	}
+	if pl.Note == nil || !strings.Contains(*pl.Note, "team_9f2") || !strings.Contains(*pl.Note, "personal scope") {
+		t.Fatalf("note = %v", pl.Note)
+	}
+}
+
+func TestCollectKiloLimits_SwitchingOrganizationsRefusesThePreviousScopesWindow(t *testing.T) {
+	// One login, first personal and then scoped to a team. The cached identity
+	// covers the scope as well as the token, so the second scope re-reads instead
+	// of inheriting the Pass window the personal one was metered with.
+	dir := t.TempDir()
+	authPath := filepath.Join(dir, "auth.json")
+	writeScope := func(team string) {
+		t.Helper()
+		entry := `{"kilo":{"type":"oauth","refresh":"rt","access":"tok"`
+		if team != "" {
+			entry += `,"accountId":"` + team + `"`
+		}
+		entry += "}}"
+		if err := os.WriteFile(authPath, []byte(entry), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("USAGEBAR_KILO_CACHE_PATH", filepath.Join(dir, "kilo-pass.json"))
+	balance := func(string, string) (*KiloBalance, error) { return &KiloBalance{Balance: 9}, nil }
+
+	writeScope("")
+	if got := CollectKiloLimits(nowMs, CollectKiloLimitsOptions{
+		AuthPath: authPath, FetchBalance: balance,
+		FetchPass: func(string) (*KiloPassState, error) { return subscribed(), nil },
+	}); got.Tertiary == nil {
+		t.Fatalf("setup: %+v", got)
+	}
+
+	writeScope("team_b")
+	calls := 0
+	got := CollectKiloLimits(nowMs+1000, CollectKiloLimitsOptions{
+		AuthPath: authPath, FetchBalance: balance,
+		FetchPass: func(string) (*KiloPassState, error) {
+			calls++
+			return subscribed(), nil
+		},
+	})
+	if calls == 0 {
+		t.Fatal("the new scope was served the previous scope's cache entry")
+	}
+	if got.Tertiary != nil {
+		t.Fatalf("the personal scope's window leaked into the team's: %+v", got.Tertiary)
+	}
+}
+
 func TestCollectKiloLimits_ANewAccountNeverInheritsAPreservedReading(t *testing.T) {
 	// One shared cache file, two distinct credential stores: the preserved
 	// snapshot is carried forward only for the login it was measured under.
@@ -499,7 +672,7 @@ func TestCollectKiloLimits_ANewAccountNeverInheritsAPreservedReading(t *testing.
 	t.Setenv("USAGEBAR_KILO_CACHE_PATH", path)
 	first := writeKiloAuth(t, t.TempDir(), "tok_first")
 	second := writeKiloAuth(t, t.TempDir(), "tok_second")
-	balance := func(string) (*KiloBalance, error) { return &KiloBalance{Balance: 9}, nil }
+	balance := func(string, string) (*KiloBalance, error) { return &KiloBalance{Balance: 9}, nil }
 
 	if got := CollectKiloLimits(nowMs, CollectKiloLimitsOptions{
 		AuthPath: first, FetchBalance: balance,

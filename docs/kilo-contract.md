@@ -30,14 +30,36 @@ contains them — counting them here would double-count the window. This is the
 same rule the OpenCode provider applies, and the same row Kilo's own "Token
 Usage" panel reads.
 
-The provider and model ids come from the `message` row that owns the step,
-because only 88 of Kilo's 9140 step rows carry their own model block. The
-context window comes from `~/.cache/kilo/models.json` at
+The provider and model ids come from the `message` row named by the step's own
+`message_id`, because only 88 of Kilo's 9140 step rows carry their own model
+block. It has to be that message and not the session's newest assistant message:
+after a model switch the newest message can belong to a call that has not
+completed a step yet, and pairing this step's tokens with that message's model
+would divide one model's context by another model's window. The context window
+comes from `~/.cache/kilo/models.json` at
 `kilo.models[modelID].limit.context`.
 
 A step whose every counter is zero is a free-model step. It yields no usage at
 all, because reading it as a 0-token context would present as an untouched
 window.
+
+### Session identity
+
+One session is chosen per pane, in one place, and context, billing mode and pane
+activity all read that one. Herdr captures `agent_session` at launch and never
+refreshes it, so a cleared or resumed session reports an id that no longer
+exists; the pane's cwd is the fallback.
+
+The fallback only attributes a session when it is **unambiguous**. Two live Kilo
+panes in one repository share a cwd, so "the newest session in this directory"
+is not evidence of which pane asked: once one pane resets its session, the newest
+row is the other pane's. Two or more live sessions in scope therefore yield no
+reading rather than another pane's context, backend and spend.
+
+The scope is the directory and its descendants — the arm that covers a worktree
+checked out under the repository. It is bounded by the path separator and carries
+`ESCAPE '\'`, so `/repo` never reaches `/repo-other` and a directory containing
+`"_"`, `"%"` or `"\"` is matched literally.
 
 ### Not used
 
@@ -92,6 +114,30 @@ that account survives: a blip is not evidence that the plan ended. The same
 holds for a response that names a plan but not a usable ratio, which does not
 say the account lost its Pass either.
 
+The cache stores the outcome, the last good reading and the failed attempt as
+three separate fields, because preserving a reading and reporting it are
+different acts. A still-fresh failed entry replays **its own** failure — no
+window, and the note naming what went wrong — never the snapshot it preserved.
+Serving that snapshot would put the previous period's window back on screen
+stamped with the failed attempt's time and carrying none of its note, and
+repeated failures would copy it forward indefinitely. The snapshot stays on disk
+for a later attempt to recover from; an entry written before the two were stored
+apart is re-read rather than served.
+
+### Scoped to an organization
+
+Kilo files the selected team in the login's `accountId`, and sends it as
+`x-kilocode-organizationid` with the balance request. The balance read is
+therefore scoped to that team's wallet.
+
+A Kilo Pass is **personal scope**: Kilo's own CLI shows it for the signed-in
+person, never for a team. A login scoped to an organization is an account with no
+monthly allowance to meter, so it gets the balance and a note naming the
+organization — and never the person's Pass window, which is a different account's
+reading entirely. The Pass request carries no organization scope for the same
+reason. This is an answer rather than a failure, so it clears a window this scope
+had.
+
 ### Deliberately not collected
 
 - **Rate limits.** Kilo publishes none, in any header or field. Any RPM/TPM
@@ -116,23 +162,24 @@ decides:
 | Session backend | Credential in Kilo's `auth.json` | Result |
 | --- | --- | --- |
 | `kilo` | `{"type":"oauth"}` gateway login | the Kilo Pass window |
+| `kilo`, with `accountId` set | same login, scoped to a team | no window; the team's balance as a note |
 | `kilo` | `{"type":"api"}` gateway key, or none | no window; keeps prior state |
 | `opencode-go` | any | routed to the OpenCode collector as "OpenCode Go" |
-| anything else | API key | pay-as-you-go, labelled with the backend |
+| anything else | API key | pay-as-you-go, labelled with the backend, with the session's own cost and tokens |
 
 A gateway API key bills the same account but cannot name it, so it is never the
 attribution for a reading.
 
-Herdr captures `agent_session` at launch and never refreshes it, so a cleared or
-resumed session reports an id that no longer exists. Resolution falls back to
-the pane's cwd only after the reported id has failed, and only when the cwd is
-non-empty — the directory match is a `LIKE`, so an empty prefix would match every
-session in the store.
+A pay-as-you-go Kilo backend shows the session's own denormalised cost and token
+counters. They are lifetime totals for the session rather than a window, which is
+what that block shows, so they are read only once the pane has been classified as
+pay-as-you-go and never contribute to a plan budget.
 
 ## Credentials
 
 The gateway access token is read for one HTTP request and never persisted. The
-cached entry stores only the resolved limits plus a hash of the token, so a
-stale cache file cannot leak a login and a second account's entry is refused
-rather than displayed. The refresh token is never read, and no API key value is
-ever copied out of the store.
+cached entry stores only the resolved limits plus a hash of the token **together
+with the selected organization**, so a stale cache file cannot leak a login, a
+second account's entry is refused rather than displayed, and switching teams
+re-reads instead of inheriting the previous scope's numbers. The refresh token is
+never read, and no API key value is ever copied out of the store.

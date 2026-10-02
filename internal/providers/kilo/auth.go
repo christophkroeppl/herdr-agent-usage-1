@@ -4,9 +4,11 @@
  * The file holds one entry per provider id, and the entry's *type* is what
  * matters for attribution. Two kinds exist here and they are not equivalent:
  *
- *   {"type":"oauth", "access": …, "refresh": …}   the Kilo Gateway device
- *       login. Its allowance is the account's, and it is the only credential
- *       that can name the account.
+ *   {"type":"oauth", "access": …, "refresh": …, "accountId": …}   the Kilo
+ *       Gateway device login. Its allowance is the account's, and it is the
+ *       only credential that can name the account. Its accountId is the
+ *       selected team, empty for a personal-scope login, and it decides whose
+ *       wallet the balance request reads.
  *
  *   {"type":"api", "key": …}                       a gateway API key. It bills
  *       the same account but says nothing about *which* account, so it can
@@ -70,12 +72,16 @@ func CredentialTypeIn(auth map[string]map[string]any, providerID string) string 
 
 // GatewayCredential is the one credential the Kilo collector may send.
 //
-// The access token is used for a single HTTP request and never persisted; the
-// AccountID is a hash of it, so it can be stamped on a cached reading to reject
-// another login's numbers without the token itself ever reaching disk.
+// The access token is used for a single HTTP request and never persisted. The
+// OrganizationID is Kilo's selected team, and Identity is a hash of the token
+// together with that scope, so a cached reading can be refused for another
+// login or another organization without either secret ever reaching disk.
 type GatewayCredential struct {
-	AccountID string
-	Access    string
+	Identity string
+	// OrganizationID is empty for a personal-scope login. A team-scoped login
+	// bills that team's wallet and never carries the person's Kilo Pass.
+	OrganizationID string
+	Access         string
 }
 
 // GatewayLogin reads the Kilo Gateway device login, or nil when the store has
@@ -97,12 +103,20 @@ func GatewayLoginIn(auth map[string]map[string]any) *GatewayCredential {
 	if kind, _ := entry["type"].(string); kind != "oauth" {
 		return nil
 	}
-	access, _ := entry["access"].(string)
-	access = strings.TrimSpace(access)
+	access := asString(entry["access"])
 	if access == "" {
 		return nil
 	}
-	return &GatewayCredential{AccountID: AccountIDForToken(access), Access: access}
+	// Kilo files the selected team in the login's accountId, and that scope
+	// decides whose wallet the balance request reads. It is part of the billing
+	// identity, not a detail of one request: a cache keyed on the token alone
+	// would hand the previous scope's numbers to the newly selected one.
+	organization := asString(entry["accountId"])
+	return &GatewayCredential{
+		Identity:       AccountIDForToken(access, organization),
+		OrganizationID: organization,
+		Access:         access,
+	}
 }
 
 // readAuthMap parses Kilo's auth.json into provider id -> entry.
@@ -141,10 +155,11 @@ func ParseAuthJSON(raw []byte) map[string]map[string]any {
 
 // AccountIDForToken is the opaque identity stamped on a cached reading.
 //
-// It is a hash of the access token, so it changes when the token does. Kilo
-// issues long-lived device logins, so in practice this is stable for the life
-// of a login; when it does change, the next refresh simply re-reads rather than
-// reusing another login's cached numbers.
-func AccountIDForToken(access string) string {
-	return CredentialID(access)
+// It is a hash of the access token together with the selected organization, so
+// it changes when either does. Kilo issues long-lived device logins, so in
+// practice this is stable for the life of a login and one scope; when it
+// changes, the next refresh simply re-reads rather than reusing the previous
+// scope's numbers.
+func AccountIDForToken(access, organizationID string) string {
+	return CredentialID(access + "\x00" + organizationID)
 }

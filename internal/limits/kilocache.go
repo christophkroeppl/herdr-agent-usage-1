@@ -35,7 +35,13 @@ type kiloCacheEntry struct {
 	FetchedAtMs int64            `json:"fetchedAtMs"`
 	AccountID   string           `json:"accountId"`
 	Outcome     kiloCacheOutcome `json:"outcome"`
-	Limits      *ProviderLimits  `json:"limits,omitempty"`
+	// Limits is the last reading this account actually produced. A failed
+	// attempt leaves it untouched, so the snapshot survives a blip for a later
+	// attempt to recover from.
+	Limits *ProviderLimits `json:"limits,omitempty"`
+	// Failure is the failed attempt's own reading: no window, and the note
+	// naming what went wrong. It is what a still-fresh failed entry replays.
+	Failure *ProviderLimits `json:"failure,omitempty"`
 }
 
 func kiloCachePath() string {
@@ -63,6 +69,32 @@ func kiloCacheFresh(entry kiloCacheEntry, accountID string, nowMs int64) bool {
 		return false
 	}
 	return nowMs-entry.FetchedAtMs < kiloCacheTTL(entry.Outcome)
+}
+
+// cachedKiloLimits replays a still-fresh cache entry for this account.
+//
+// A failed entry replays its own failure state, never the snapshot it
+// preserved. That snapshot is what a later attempt may recover from, not what
+// the failure proved: serving it here would put the previous period's window
+// back on screen stamped with the failed attempt's time and none of its note,
+// and repeated failures would copy it forward indefinitely.
+func cachedKiloLimits(entry kiloCacheEntry, accountID string, nowMs int64) (ProviderLimits, bool) {
+	if !kiloCacheFresh(entry, accountID, nowMs) {
+		return ProviderLimits{}, false
+	}
+	reading := entry.Limits
+	if entry.Outcome == kiloOutcomeFailed {
+		// An entry written before failures were recorded separately carries only
+		// the snapshot. Refusing it is the safe direction: re-reading costs one
+		// request, while serving it would report an unmeasured window as fresh.
+		reading = entry.Failure
+	}
+	if reading == nil {
+		return ProviderLimits{}, false
+	}
+	replay := *reading
+	replay.FetchedAtMs = entry.FetchedAtMs
+	return replay, true
 }
 
 // readKiloCache returns whatever is on disk, fresh or not. The collector needs

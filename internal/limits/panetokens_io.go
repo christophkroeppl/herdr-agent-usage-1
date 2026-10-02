@@ -13,6 +13,7 @@ import (
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/claude"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/codex"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/grok"
+	"github.com/senna-lang/herdr-agent-usage/internal/providers/kilo"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/omp"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/opencode"
 	_ "modernc.org/sqlite"
@@ -327,7 +328,26 @@ func PaneTotalUsage(providerID string, pane OpenPaneSnapshot, nowMs int64) (toke
 	if providerID == "pi" {
 		return piActivityForPaneBackend(pane, piPaneBackendID(pane), 0, nowMs)
 	}
+	if providerID == "kilo" {
+		return kiloActivityForPane(pane)
+	}
 	return TokensForPaneAnyBackend(providerID, pane, 0, nowMs), 0
+}
+
+// kiloActivityForPane reports a Kilo pane's own session totals.
+//
+// Kilo backfills cost and token counters onto the session row, so the pane's
+// whole-session spend is one bounded read instead of a scan of its parts. Those
+// totals are neither backend-scoped nor windowed — they are lifetime figures for
+// the session — which is exactly what the pay-as-you-go block shows, so they are
+// read only once the pane has been classified as pay-as-you-go and never
+// contribute to a plan-budget window.
+func kiloActivityForPane(pane OpenPaneSnapshot) (tokens float64, costUSD float64) {
+	summary, ok := kilo.SessionActivityForKilo(pane.SessionID, pane.Cwd)
+	if !ok {
+		return 0, 0
+	}
+	return float64(summary.TotalTokens()), summary.Cost
 }
 
 // TokensForPaneAnyBackend sums a pane's tokens in [startMs, endMs] across any

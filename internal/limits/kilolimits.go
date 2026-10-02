@@ -43,6 +43,11 @@ const kiloMonthlyWindowMinutes = 30 * 24 * 60
 // this plugin cannot vouch for.
 const kiloAPIURL = "https://api.kilo.ai"
 
+// kiloOrganizationHeader is Kilo's scope header for the selected team. Kilo's
+// own client sends the login's accountId with every wallet request, so the
+// balance this collector reads is the selected team's and not the person's.
+const kiloOrganizationHeader = "x-kilocode-organizationid"
+
 // kiloPassLiveStatuses is the set Kilo's own CLI treats as a live subscription.
 // Any other status means the plan is not paying for the session.
 var kiloPassLiveStatuses = map[string]bool{
@@ -79,9 +84,12 @@ type KiloPassState struct {
 type CollectKiloLimitsOptions struct {
 	// AuthPath defaults to Kilo's resolved auth.json.
 	AuthPath string
-	// FetchPass and FetchBalance default to the real endpoints.
-	FetchPass    func(access string) (*KiloPassState, error)
-	FetchBalance func(access string) (*KiloBalance, error)
+	// FetchPass defaults to the real endpoint. A Kilo Pass is personal scope, so
+	// it is never read with an organization scope attached.
+	FetchPass func(access string) (*KiloPassState, error)
+	// FetchBalance defaults to the real endpoint, and takes the selected
+	// organization because the wallet it reads is that team's.
+	FetchBalance func(access, organizationID string) (*KiloBalance, error)
 	// Now defaults to the passed nowMs; tests pin it.
 	Now func() int64
 }
@@ -104,17 +112,30 @@ const (
 	kiloPassFailed
 )
 
+// kiloPassQuery is one account's already-fetched answer, plus the scope it was
+// fetched for. Grouping them keeps the ladder in kiloProviderLimits about
+// reading the facts rather than about where they came from.
+type kiloPassQuery struct {
+	Pass           *KiloPassState
+	PassErr        error
+	Balance        *KiloBalance
+	BalanceErr     error
+	OrganizationID string
+}
+
 // CollectKiloLimits builds a ProviderLimits for one Kilo account.
 //
 // The ladder is deliberate. A window only ever comes from a Kilo Pass
 // subscription; balance only ever becomes part of a note; and every dead end
 // produces a note naming the cause rather than a fabricated bar. The result is
-// cached against the login's identity, so a second account on the same machine
-// never sees the first one's numbers.
+// cached against the login's identity and scope, so a second account — or the
+// same account after a switch to another organization — never sees the
+// numbers its predecessor produced.
 //
-// The cache carries the outcome separately from the snapshot, because a failed
-// fetch must record that it happened — so the next refresh does not re-hit the
-// endpoint — without destroying the last good reading it did not disprove.
+// The cache carries the outcome, the last good reading and the failed attempt
+// apart. A failed fetch must record that it happened, so the next refresh does
+// not re-hit the endpoint, without either destroying the reading it did not
+// disprove or passing that reading off as the result of the failure.
 func CollectKiloLimits(nowMs int64, opts CollectKiloLimitsOptions) ProviderLimits {
 	const providerID = "kilo"
 	const label = "Kilo"
@@ -131,10 +152,8 @@ func CollectKiloLimits(nowMs int64, opts CollectKiloLimitsOptions) ProviderLimit
 	}
 
 	previous, _ := readKiloCache()
-	if previous.AccountID == credential.AccountID && kiloCacheFresh(previous, credential.AccountID, nowMs) && previous.Limits != nil {
-		pl := *previous.Limits
-		pl.FetchedAtMs = previous.FetchedAtMs
-		return pl
+	if cached, ok := cachedKiloLimits(previous, credential.Identity, nowMs); ok {
+		return cached
 	}
 
 	fetchPass := opts.FetchPass
@@ -146,26 +165,42 @@ func CollectKiloLimits(nowMs int64, opts CollectKiloLimitsOptions) ProviderLimit
 		fetchBalance = fetchKiloBalance
 	}
 
-	balance, balanceErr := fetchBalance(credential.Access)
+	balance, balanceErr := fetchBalance(credential.Access, credential.OrganizationID)
 	pass, passErr := fetchPass(credential.Access)
-	pl, outcome := kiloProviderLimits(providerID, label, pass, passErr, balance, balanceErr, nowMs)
+	pl, outcome := kiloProviderLimits(providerID, label, kiloPassQuery{
+		Pass:           pass,
+		PassErr:        passErr,
+		Balance:        balance,
+		BalanceErr:     balanceErr,
+		OrganizationID: credential.OrganizationID,
+	}, nowMs)
 
 	entry := kiloCacheEntry{
 		FetchedAtMs: nowMs,
-		AccountID:   credential.AccountID,
+		AccountID:   credential.Identity,
 		Outcome:     kiloOutcomeFor(outcome),
 		Limits:      &pl,
 	}
 	if outcome == kiloPassFailed {
-		// The attempt is recorded, the reading is not. A blip at the endpoint
-		// says nothing about whether the account still has its Pass, so the
-		// last good snapshot stays exactly as it was.
-		if previous.AccountID == credential.AccountID && previous.Limits != nil {
-			entry.Limits = previous.Limits
-		}
+		// The attempt is recorded in its own right; the reading is not. A blip
+		// at the endpoint says nothing about whether the account still has its
+		// Pass, so the last good snapshot survives for a later attempt and the
+		// failure is stored beside it rather than in place of it.
+		entry.Failure = &pl
+		entry.Limits = preservedKiloSnapshot(previous, credential.Identity)
 	}
 	saveKiloCache(entry)
 	return pl
+}
+
+// preservedKiloSnapshot is the last good reading for this same identity, and
+// nothing else: an entry measured under a different login or a different
+// selected organization must never carry its numbers into this one.
+func preservedKiloSnapshot(previous kiloCacheEntry, identity string) *ProviderLimits {
+	if previous.AccountID != identity || previous.Limits == nil {
+		return nil
+	}
+	return previous.Limits
 }
 
 func kiloOutcomeFor(outcome kiloPassOutcome) kiloCacheOutcome {
@@ -175,7 +210,7 @@ func kiloOutcomeFor(outcome kiloPassOutcome) kiloCacheOutcome {
 	return kiloOutcomeFetched
 }
 
-func kiloProviderLimits(providerID, label string, pass *KiloPassState, passErr error, balance *KiloBalance, balanceErr error, nowMs int64) (ProviderLimits, kiloPassOutcome) {
+func kiloProviderLimits(providerID, label string, q kiloPassQuery, nowMs int64) (ProviderLimits, kiloPassOutcome) {
 	pl := ProviderLimits{
 		ProviderID:  providerID,
 		Label:       label,
@@ -183,12 +218,24 @@ func kiloProviderLimits(providerID, label string, pass *KiloPassState, passErr e
 		FetchedAtMs: nowMs,
 	}
 
+	// A Kilo Pass belongs to the signed-in person; the CLI shows it for personal
+	// scope only. A login scoped to an organization therefore has no monthly
+	// allowance to meter, and putting the personal Pass on a team's spend would
+	// be a different account's reading entirely. This is an answer, not a
+	// failure, so it clears a window this scope had.
+	if q.OrganizationID != "" {
+		pl.Source = "none"
+		pl.Note = kiloAccountNote(q.Balance, q.BalanceErr, strPtr(
+			"billed to organization "+q.OrganizationID+" — a Kilo Pass is personal scope only, so this team's spend has no monthly allowance to meter"))
+		return pl, kiloPassNoPass
+	}
+
 	// Exactly one half of the ratio is a half-reported period, not an account
 	// without a plan: the server named the plan but not a ratio this can use,
 	// and did not say the plan ended.
-	if pass != nil && pass.HasAllowanceParts != pass.HasUsageParts {
+	if q.Pass != nil && q.Pass.HasAllowanceParts != q.Pass.HasUsageParts {
 		pl.Source = "none"
-		pl.Note = kiloAccountNote(balance, balanceErr, strPtr(
+		pl.Note = kiloAccountNote(q.Balance, q.BalanceErr, strPtr(
 			"Kilo Pass reported only part of this period's credit allowance, which cannot be turned into a percentage"))
 		return pl, kiloPassFailed
 	}
@@ -196,44 +243,44 @@ func kiloProviderLimits(providerID, label string, pass *KiloPassState, passErr e
 	// The status gates the ratio, so it is checked first. A cancelled or unpaid
 	// plan keeps reporting the amounts it last had, and metering those would
 	// leave a window on screen for a plan that is no longer paying.
-	if pass != nil && pass.Status != "" && !kiloPassLiveStatuses[pass.Status] {
+	if q.Pass != nil && q.Pass.Status != "" && !kiloPassLiveStatuses[q.Pass.Status] {
 		pl.Source = "none"
-		pl.Note = kiloAccountNote(balance, balanceErr,
-			strPtr("Kilo Pass is "+pass.Status+" — nothing left to meter"))
+		pl.Note = kiloAccountNote(q.Balance, q.BalanceErr,
+			strPtr("Kilo Pass is "+q.Pass.Status+" — nothing left to meter"))
 		return pl, kiloPassNoPass
 	}
 
-	if pass != nil && pass.HasAllowanceParts && pass.HasUsageParts {
-		allowance := pass.BaseCreditsUSD + pass.BonusCreditsUSD
-		if window := kiloMonthlyWindow(allowance, pass.UsageUSD, pass.NextBillingAt); window != nil {
+	if q.Pass != nil && q.Pass.HasAllowanceParts && q.Pass.HasUsageParts {
+		allowance := q.Pass.BaseCreditsUSD + q.Pass.BonusCreditsUSD
+		if window := kiloMonthlyWindow(allowance, q.Pass.UsageUSD, q.Pass.NextBillingAt); window != nil {
 			pl.Tertiary = window
 			plan := "Kilo Pass · monthly credits"
 			pl.PlanType = &plan
-			pl.Note = kiloAccountNote(balance, balanceErr, nil)
+			pl.Note = kiloAccountNote(q.Balance, q.BalanceErr, nil)
 			return pl, kiloPassAllowance
 		}
 		// The response named a plan but not a usable ratio. It does not say the
 		// account lost its Pass, so it is a failure, not a clearing answer:
 		// whatever this account had stays.
 		pl.Source = "none"
-		pl.Note = kiloAccountNote(balance, balanceErr,
+		pl.Note = kiloAccountNote(q.Balance, q.BalanceErr,
 			strPtr("Kilo Pass reported no usable credit allowance for this period"))
 		return pl, kiloPassFailed
 	}
 
 	switch {
-	case passErr != nil:
+	case q.PassErr != nil:
 		// A request that failed says nothing about the account.
 		pl.Source = "none"
-		pl.Note = kiloAccountNote(balance, balanceErr,
-			strPtr("Kilo Pass allowance could not be read: "+passErr.Error()))
+		pl.Note = kiloAccountNote(q.Balance, q.BalanceErr,
+			strPtr("Kilo Pass allowance could not be read: "+q.PassErr.Error()))
 		return pl, kiloPassFailed
 	default:
 		// subscription: null. The account pays from a shared credit balance
 		// rather than a plan. A normal state, not a failure, and it clears any
 		// window this account had.
 		pl.Source = "kilo balance"
-		pl.Note = kiloAccountNote(balance, balanceErr, strPtr(
+		pl.Note = kiloAccountNote(q.Balance, q.BalanceErr, strPtr(
 			"no Kilo Pass — this account pays from a shared credit balance, which Kilo reports without a limit, so there is no quota percentage to show"))
 		return pl, kiloPassNoPass
 	}
@@ -302,13 +349,20 @@ func kiloHTTPClient() *http.Client {
 	}
 }
 
-func kiloGet(client *http.Client, endpoint, access string) (any, error) {
+// kiloGet performs one credential-bearing request. The selected organization is
+// sent as the scope header Kilo's own client sends, because the wallet behind
+// the balance endpoint belongs to that team; it is omitted for a personal-scope
+// login, which is what Kilo's CLI does.
+func kiloGet(client *http.Client, endpoint, access, organizationID string) (any, error) {
 	request, err := http.NewRequest(http.MethodGet, kiloAPIURL+endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
 	request.Header.Set("Authorization", "Bearer "+access)
 	request.Header.Set("Accept", "application/json")
+	if organizationID != "" {
+		request.Header.Set(kiloOrganizationHeader, organizationID)
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
@@ -331,9 +385,9 @@ func kiloGet(client *http.Client, endpoint, access string) (any, error) {
 	return payload, nil
 }
 
-// fetchKiloBalance reads the prepaid credit wallet.
-func fetchKiloBalance(access string) (*KiloBalance, error) {
-	payload, err := kiloGet(kiloHTTPClient(), "/api/profile/balance", access)
+// fetchKiloBalance reads the prepaid credit wallet of the selected scope.
+func fetchKiloBalance(access, organizationID string) (*KiloBalance, error) {
+	payload, err := kiloGet(kiloHTTPClient(), "/api/profile/balance", access, organizationID)
 	if err != nil {
 		return nil, err
 	}
@@ -351,15 +405,18 @@ func fetchKiloBalance(access string) (*KiloBalance, error) {
 
 // fetchKiloPassState reads the Kilo Pass allowance.
 //
-// A null subscription is not an error: it is the account paying from a shared
-// balance instead of a plan. It returns a state with no allowance parts, so
-// the caller reports the balance and says why there is no bar.
+// The allowance is personal scope, so this request carries no organization: the
+// caller never meters a Pass for an organization-scoped login, and asking for
+// one would only invite reading another scope's plan here. A null subscription
+// is not an error: it is the account paying from a shared balance instead of a
+// plan. It returns a state with no allowance parts, so the caller reports the
+// balance and says why there is no bar.
 func fetchKiloPassState(access string) (*KiloPassState, error) {
 	endpoint := "/api/trpc/kiloPass.getState?" + url.Values{
 		"batch": {"1"},
 		"input": {`{"0":null}`},
 	}.Encode()
-	payload, err := kiloGet(kiloHTTPClient(), endpoint, access)
+	payload, err := kiloGet(kiloHTTPClient(), endpoint, access, "")
 	if err != nil {
 		return nil, err
 	}
