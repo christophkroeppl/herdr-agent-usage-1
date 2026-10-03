@@ -17,6 +17,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/senna-lang/herdr-agent-usage/internal/core"
 	_ "modernc.org/sqlite"
@@ -26,6 +27,17 @@ import (
 // row is all that is needed; the rest exist so that a session whose newest step
 // was compacted or truncated still resolves from an earlier one.
 const stepScanLimit = 24
+
+// liveSessionWindowMs is how recently a session must have been written to for a
+// directory to still consider it a live pane's.
+//
+// It only ever filters the cwd fallback, never a pane's own reported id: a pane
+// whose id still resolves is attributed however old its session is. The value is
+// a compromise between the two ways being wrong — too long and yesterday's
+// finished session makes today's single pane look shared, too short and a pane
+// left open overnight stops reporting — so it spans a working day rather than a
+// working shift.
+const liveSessionWindowMs = 12 * 60 * 60 * 1000
 
 // stepQuery reads the tail of a session's step-finish rows. The owning message
 // id is selected alongside the payload because that message — not the session's
@@ -60,9 +72,21 @@ const partIdentityQuery = `
 	  AND json_valid(m.data)
 	LIMIT 1`
 
-// directoryScopeQuery lists the live sessions a pane working in one directory
-// could be using: that directory itself, or anything beneath it, which is how a
+// directoryScopeQuery lists the sessions a pane working in one directory could
+// be using: that directory itself, or anything beneath it, which is how a
 // worktree checked out under the repository is covered.
+//
+// "Could be using" is narrower than "recorded in that directory", and each
+// predicate narrows it deliberately:
+//
+//   - parent_id IS NULL keeps subagent child sessions out. A child runs inside
+//     its parent's process and no pane ever launches one, so counting it makes a
+//     directory look shared when exactly one pane is in it.
+//   - time_updated is the liveness evidence. A session nobody has written to for
+//     longer than liveSessionWindowMs is history, not a pane: leaving it in
+//     scope is what makes a directory ambiguous over a session that cannot be
+//     running, which costs the pane its own context and billing the moment its
+//     captured id goes stale.
 //
 // It deliberately reads two rows. The caller has to be able to tell an
 // unambiguous match from a shared one, which a LIMIT 1 newest-first query
@@ -75,16 +99,11 @@ const partIdentityQuery = `
 const directoryScopeQuery = `
 	SELECT id FROM session
 	WHERE time_archived IS NULL
+	  AND parent_id IS NULL
+	  AND time_updated >= ?
 	  AND (directory = ? OR directory LIKE ? ESCAPE '\')
 	ORDER BY time_updated DESC
 	LIMIT 2`
-
-const summaryQuery = `
-	SELECT cost, tokens_input, tokens_output, tokens_reasoning,
-	       tokens_cache_read, tokens_cache_write, COALESCE(model, '')
-	FROM session
-	WHERE id = ?
-	LIMIT 1`
 
 func openReadonlyDB(path string) (*sql.DB, error) {
 	return sql.Open("sqlite", "file:"+path+"?mode=ro")
@@ -190,13 +209,19 @@ func resolveSessionIDIn(db *sql.DB, sessionID, cwd *string) string {
 // report another pane's context and backend. A directory therefore attributes a
 // session only when exactly one live session is in scope. Ambiguity yields no
 // reading rather than a confidently wrong one.
+//
+// "Live" is the directoryScopeQuery scope rather than "not archived": a
+// subagent child and a session last touched days ago are both recorded under
+// the same directory and neither is a pane, so counting either would make a
+// directory ambiguous over rows that cannot be the answer.
 func resolveSessionIDByCwd(db *sql.DB, cwd string) string {
 	directory := normalizeDirectory(cwd)
 	if directory == "" {
 		return ""
 	}
+	floor := time.Now().UnixMilli() - liveSessionWindowMs
 	separator := string(filepath.Separator)
-	rows, err := db.Query(directoryScopeQuery, directory, escapeLike(directory+separator)+"%")
+	rows, err := db.Query(directoryScopeQuery, floor, directory, escapeLike(directory+separator)+"%")
 	if err != nil {
 		return ""
 	}
@@ -318,68 +343,6 @@ func sessionCache(db *sql.DB, sessionID string, newest *StepUsage) *core.CacheUs
 		}
 	}
 	return core.CacheFromTokenCounts(fresh, read, write)
-}
-
-// SessionSummaryForKilo reads the session's own denormalised totals.
-//
-// Kilo backfills these columns from its assistant messages, so they are the
-// cheapest steady source of per-session cost and token movement. They are
-// lifetime session totals, not a window: use them for pane activity and cost
-// labels, never for a context percentage.
-func SessionSummaryForKilo(sessionID *string) (SessionSummary, bool) {
-	if sessionID == nil || strings.TrimSpace(*sessionID) == "" {
-		return SessionSummary{}, false
-	}
-	dbPath := ResolveKiloDBPath()
-	if dbPath == "" {
-		return SessionSummary{}, false
-	}
-	return sessionSummaryIn(dbPath, *sessionID)
-}
-
-// SessionActivityForKilo names the pane's session and reads its totals in one
-// open of the store.
-//
-// The pane's cwd is part of the signature so the caller cannot accidentally read
-// a session the pane's context is not coming from: a pane whose reported id no
-// longer resolves still reports the session its context resolves to.
-func SessionActivityForKilo(sessionID, cwd *string) (SessionSummary, bool) {
-	dbPath := ResolveKiloDBPath()
-	if dbPath == "" {
-		return SessionSummary{}, false
-	}
-	db, err := openReadonlyDB(dbPath)
-	if err != nil {
-		return SessionSummary{}, false
-	}
-	defer db.Close()
-	id := resolveSessionIDIn(db, sessionID, cwd)
-	if id == "" {
-		return SessionSummary{}, false
-	}
-	return sessionSummary(db, id)
-}
-
-func sessionSummaryIn(dbPath, sessionID string) (SessionSummary, bool) {
-	db, err := openReadonlyDB(dbPath)
-	if err != nil {
-		return SessionSummary{}, false
-	}
-	defer db.Close()
-	return sessionSummary(db, sessionID)
-}
-
-func sessionSummary(db *sql.DB, sessionID string) (SessionSummary, bool) {
-	var (
-		cost                                  float64
-		input, output, reasoning, read, write int
-		modelJSON                             string
-	)
-	row := db.QueryRow(summaryQuery, sessionID)
-	if err := row.Scan(&cost, &input, &output, &reasoning, &read, &write, &modelJSON); err != nil {
-		return SessionSummary{}, false
-	}
-	return SessionSummaryFromRow(cost, input, output, reasoning, read, write, modelJSON), true
 }
 
 // BackendForKilo reports which backend served a pane's session.

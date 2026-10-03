@@ -19,6 +19,11 @@
  * The newest step-finish row is the authoritative context reading, so the
  * model/provider identity comes from the message that owns the step and falls
  * back to the step itself, which is what Kilo's own query does.
+ *
+ * The denormalised token and cost columns on the session row are deliberately
+ * not decoded here. They are lifetime totals for every backend the session ever
+ * used, so they cannot answer what one backend spent; spend is summed per backend
+ * from the messages in spend.go.
  */
 package kilo
 
@@ -127,52 +132,6 @@ func ParseMessageIdentity(raw string) MessageIdentity {
 		ProviderID: asString(data["providerID"]),
 		ModelID:    asString(data["modelID"]),
 	}
-}
-
-// SessionSummary aggregates one session's denormalised usage columns.
-//
-// Kilo maintains cost and token totals directly on the session row and
-// backfills them from the assistant messages, so they are cheaper and steadier
-// than re-aggregating every part. They are lifetime totals for the session,
-// not a window, so callers use them for pane activity and never for a context
-// percentage.
-type SessionSummary struct {
-	Cost         float64
-	TokensInput  int
-	TokensOutput int
-	TokensReason int
-	TokensRead   int
-	TokensWrite  int
-	ProviderID   string
-	ModelID      string
-}
-
-// TotalTokens is every token the session has moved through any path.
-func (s SessionSummary) TotalTokens() int {
-	return s.TokensInput + s.TokensOutput + s.TokensReason + s.TokensRead + s.TokensWrite
-}
-
-// SessionSummaryFromRow builds a summary from one scanned session row.
-func SessionSummaryFromRow(cost float64, tokensInput, tokensOutput, tokensReasoning, tokensRead, tokensWrite int, modelJSON string) SessionSummary {
-	summary := SessionSummary{
-		Cost:         cost,
-		TokensInput:  tokensInput,
-		TokensOutput: tokensOutput,
-		TokensReason: tokensReasoning,
-		TokensRead:   tokensRead,
-		TokensWrite:  tokensWrite,
-	}
-	// session.model is a JSON object {"id","providerID","variant"} and is only
-	// populated on newer sessions, so an empty value here is normal and simply
-	// leaves the pane without a backend name.
-	if strings.TrimSpace(modelJSON) != "" {
-		var model map[string]any
-		if err := json.Unmarshal([]byte(modelJSON), &model); err == nil {
-			summary.ModelID = asString(model["id"])
-			summary.ProviderID = asString(model["providerID"])
-		}
-	}
-	return summary
 }
 
 func mapValue(m map[string]any, key string) any {

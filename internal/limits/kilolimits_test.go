@@ -268,6 +268,38 @@ func TestCollectKiloLimits_APassFailureIsReportedNotGuessed(t *testing.T) {
 	}
 }
 
+func TestCollectKiloLimits_ASubscriptionWithoutAStatusIsNotMetered(t *testing.T) {
+	// The contract meters a status Kilo reported as live, and nothing else. A
+	// response naming this period's full allowance and its spend but no status has
+	// not said the plan is paying for the session — so it produces no bar. It has
+	// not said the plan stopped either, so unlike a rejected status it must not
+	// clear: the account's last good reading is what survives.
+	stateless := subscribed()
+	stateless.Status = ""
+
+	f := newKiloFixture(t)
+	if got := f.collect(t, subscribed(), nil); got.Tertiary == nil {
+		t.Fatalf("setup: %+v", got)
+	}
+
+	got := f.collect(t, stateless, nil)
+	if got.Source != "none" {
+		t.Fatalf("source = %q, want none", got.Source)
+	}
+	for _, w := range []*LimitWindow{got.Primary, got.Secondary, got.Tertiary} {
+		if w != nil {
+			t.Fatalf("a plan with no reported status was metered: %+v", w)
+		}
+	}
+	if got.Note == nil || !strings.Contains(*got.Note, "no subscription status") {
+		t.Fatalf("note = %v", got.Note)
+	}
+	// The account keeps the reading the missing status did not disprove.
+	if month := f.cached(t); month == nil {
+		t.Fatal("a missing status destroyed the last good reading")
+	}
+}
+
 func TestCollectKiloLimits_TheCacheNeverServesAnotherAccountsReading(t *testing.T) {
 	// The cache is keyed by the login's hashed identity. Two accounts on one
 	// machine must never see each other's numbers, however recent the entry is.

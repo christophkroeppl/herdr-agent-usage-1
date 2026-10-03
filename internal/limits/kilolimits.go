@@ -79,6 +79,20 @@ type KiloPassState struct {
 	HasUsageParts     bool
 }
 
+// HasSubscription reports whether the response named a plan at all, as opposed to
+// subscription: null — an account paying from a shared credit balance. Any of the
+// three plan fields is enough: a plan can be reported by its status alone, and an
+// amount with no status is still a plan whose allowance was named.
+func (s *KiloPassState) HasSubscription() bool {
+	return s != nil && (s.Status != "" || s.HasAllowanceParts || s.HasUsageParts)
+}
+
+// HasRatio reports whether the response named both halves of this period's credit
+// ratio, which is the only shape that can become a window at all.
+func (s *KiloPassState) HasRatio() bool {
+	return s != nil && s.HasAllowanceParts && s.HasUsageParts
+}
+
 // CollectKiloLimitsOptions injects every dependency, so no test reaches the
 // network or the developer's real Kilo account.
 type CollectKiloLimitsOptions struct {
@@ -233,26 +247,39 @@ func kiloProviderLimits(providerID, label string, q kiloPassQuery, nowMs int64) 
 	// Exactly one half of the ratio is a half-reported period, not an account
 	// without a plan: the server named the plan but not a ratio this can use,
 	// and did not say the plan ended.
-	if q.Pass != nil && q.Pass.HasAllowanceParts != q.Pass.HasUsageParts {
+	if q.Pass.HasSubscription() && q.Pass.HasAllowanceParts != q.Pass.HasUsageParts {
 		pl.Source = "none"
 		pl.Note = kiloAccountNote(q.Balance, q.BalanceErr, strPtr(
 			"Kilo Pass reported only part of this period's credit allowance, which cannot be turned into a percentage"))
 		return pl, kiloPassFailed
 	}
 
-	// The status gates the ratio, so it is checked first. A cancelled or unpaid
-	// plan keeps reporting the amounts it last had, and metering those would
-	// leave a window on screen for a plan that is no longer paying.
-	if q.Pass != nil && q.Pass.Status != "" && !kiloPassLiveStatuses[q.Pass.Status] {
+	// A rejected status is an answer whatever else the response named: the plan is
+	// over, so this clears any window this account had. It is read before the
+	// ratio because a cancelled or unpaid plan keeps reporting the amounts it last
+	// had, and metering those would leave a window on screen for a plan that is no
+	// longer paying.
+	if q.Pass.HasSubscription() && q.Pass.Status != "" && !kiloPassLiveStatuses[q.Pass.Status] {
 		pl.Source = "none"
 		pl.Note = kiloAccountNote(q.Balance, q.BalanceErr,
 			strPtr("Kilo Pass is "+q.Pass.Status+" — nothing left to meter"))
 		return pl, kiloPassNoPass
 	}
 
-	if q.Pass != nil && q.Pass.HasAllowanceParts && q.Pass.HasUsageParts {
+	if q.Pass.HasRatio() {
 		allowance := q.Pass.BaseCreditsUSD + q.Pass.BonusCreditsUSD
 		if window := kiloMonthlyWindow(allowance, q.Pass.UsageUSD, q.Pass.NextBillingAt); window != nil {
+			// The contract meters a status Kilo actually reported as live. A
+			// response that named this period's amounts but no status has not said
+			// the plan is paying for the session, which is a missing fact rather
+			// than a rejected plan: it preserves this identity's last good window
+			// instead of clearing it.
+			if q.Pass.Status == "" {
+				pl.Source = "none"
+				pl.Note = kiloAccountNote(q.Balance, q.BalanceErr, strPtr(
+					"Kilo Pass reported no subscription status, so this period's credit allowance cannot be metered"))
+				return pl, kiloPassFailed
+			}
 			pl.Tertiary = window
 			plan := "Kilo Pass · monthly credits"
 			pl.PlanType = &plan

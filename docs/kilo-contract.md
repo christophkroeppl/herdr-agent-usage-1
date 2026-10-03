@@ -56,6 +56,23 @@ is not evidence of which pane asked: once one pane resets its session, the newes
 row is the other pane's. Two or more live sessions in scope therefore yield no
 reading rather than another pane's context, backend and spend.
 
+"Recorded in this directory" is broader than "could be this pane's session", and
+the scope drops the two kinds of row that cannot be:
+
+- `parent_id IS NULL`. A subagent child session runs inside its parent's process
+  and no pane ever launches one, so counting it makes a directory with a single
+  pane in it look shared.
+- `time_updated` within the last 12 hours. A session nobody has written to for a
+  working day is history, not a pane. This is liveness evidence: `time_archived
+  IS NULL` only says the session was never archived, and on a real store most
+  never are. 12 hours spans a working day, so a pane left open overnight still
+  resolves while yesterday's finished session does not block today's.
+
+Both narrowings only remove rows that cannot be the answer. Two live top-level
+sessions are two panes, and the fallback still yields nothing for them. The
+recency floor never applies to a pane's own reported id: a session whose id still
+resolves is attributed however old it is.
+
 The scope is the directory and its descendants — the arm that covers a worktree
 checked out under the repository. It is bounded by the path separator and carries
 `ESCAPE '\'`, so `/repo` never reaches `/repo-other` and a directory containing
@@ -63,8 +80,11 @@ checked out under the repository. It is bounded by the path separator and carrie
 
 ### Not used
 
-- `session.model` is populated on only some sessions; it is read for pane
-  activity and cost labels, never for attribution.
+- `session.model` is populated on only some sessions and is SQL NULL on most; it
+  names the session's *last* model, which says nothing about what an earlier
+  backend was spent on. It is not read.
+- `session.cost` / `session.tokens_*` are lifetime totals across every backend the
+  session used (see Identity), so they cannot answer a per-backend question.
 - `session_context_epoch` exists in the schema but is empty in 7.8.1, so it is
   not a usable source.
 - `session_message` and `session_input` (the v2 tables) are empty in 7.8.1. All
@@ -108,11 +128,18 @@ state rather than to an error the user has to read — and both are answers, not
 failures, so both **clear** a window this account had. A cancelled plan keeps
 reporting the amounts it last had, so the status is checked before the ratio.
 
+A window requires a status Kilo actually reported as live. A response that named
+this period's allowance and its spend but **no** status is not metered either:
+the contract allows only `active`, `past_due` and `trialing`, and a response that
+names none has not said the plan is paying for the session. That is a missing
+fact rather than a rejected plan, so it **preserves** the last good window
+instead of clearing it.
+
 The two failure kinds are kept apart deliberately. A request that fails —
 transport, auth, server, decode — saves nothing, so the last good reading for
 that account survives: a blip is not evidence that the plan ended. The same
-holds for a response that names a plan but not a usable ratio, which does not
-say the account lost its Pass either.
+holds for a response that names a plan but not a usable ratio, and for one that
+names no status, neither of which says the account lost its Pass.
 
 The cache stores the outcome, the last good reading and the failed attempt as
 three separate fields, because preserving a reading and reporting it are
@@ -170,10 +197,31 @@ decides:
 A gateway API key bills the same account but cannot name it, so it is never the
 attribution for a reading.
 
-A pay-as-you-go Kilo backend shows the session's own denormalised cost and token
-counters. They are lifetime totals for the session rather than a window, which is
-what that block shows, so they are read only once the pane has been classified as
-pay-as-you-go and never contribute to a plan budget.
+A pay-as-you-go Kilo backend produces an Agent Usage block like any other
+harness, read from the store the same way. Its spend is summed **per backend**
+from the assistant messages, which carry the backend that served each turn, and
+it covers every session touched in the window rather than only the open pane's —
+subagent children included, since their spend is drawn on the same credential.
+The panel's block is labelled with the backend its pane is on now, so the gateway
+spend a session accumulated earlier is not counted under a later label; it
+already sits on the Kilo Pass window.
+
+That per-backend scope is also why the session row's own token and cost columns
+are never read. Kilo backfills them from its messages, but they are lifetime
+totals for **every** backend the session ever used: a session that switched from
+the gateway to a vendor key has one set of totals and two backends. Reading them
+charges the earlier backend's spend to the later one's label, and presents
+gateway spend a second time as a vendor bill. The figures a pay-as-you-go pane
+shows are still lifetime rather than windowed — that is what the block shows — and
+they are read only once the pane has been classified pay-as-you-go, never for a
+plan budget.
+
+The account-wide scan is driven from the session table rather than the message
+table, with `CROSS JOIN` to pin that order: a plain `JOIN` lets SQLite choose the
+multi-million-row message table as the outer loop, and the panel refreshes on a
+15s ticker. Session is a few thousand rows and narrows the read to the sessions
+that can hold a message in the window, each read through
+`message_session_time_created_id_idx`.
 
 ## Credentials
 
