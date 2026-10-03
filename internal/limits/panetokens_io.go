@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	providercontract "github.com/senna-lang/herdr-agent-usage/internal/provider"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/claude"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/codex"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/grok"
@@ -309,6 +310,9 @@ func tokensForPaneWith(profiles []claude.ClaudeProfile, codexProfiles []codex.Co
 // costUSD is 0 when the harness records no local cost (Codex/Claude/Grok)
 // rather than when spend was genuinely zero.
 func PaneTotalUsage(providerID string, pane OpenPaneSnapshot, nowMs int64) (tokens float64, costUSD float64) {
+	if session, found := SessionBillingForPane(pane); found {
+		return float64(session.Tokens), session.CostUSD
+	}
 	if profile, ok := openCodeProfileByIDIn(ResolvedOpenCodeProfiles(), providerID); ok {
 		if profile.Implicit {
 			backendID := payAsYouGoBackendID(providerID, pane)
@@ -533,6 +537,15 @@ func cwdStr(pane OpenPaneSnapshot) string {
 		return ""
 	}
 	return *pane.Cwd
+}
+
+// paneBillingInput adapts one open pane to the shared provider resolve input.
+func paneBillingInput(pane OpenPaneSnapshot) providercontract.UsageResolveInput {
+	var session *providercontract.AgentSession
+	if pane.SessionID != nil {
+		session = &providercontract.AgentSession{Kind: "id", Value: *pane.SessionID}
+	}
+	return providercontract.UsageResolveInput{Session: session, Cwd: pane.Cwd, PaneID: &pane.PaneID}
 }
 
 // claudeTokensForPaneIn sums one pane's windowed tokens from an explicit

@@ -59,6 +59,16 @@ func TestUsageStatusCandidates_WithoutWindow(t *testing.T) {
 	}
 }
 
+func TestUsageStatusCandidates_Unavailable(t *testing.T) {
+	u := ContextUsage{ContextUnavailable: true, WindowTokens: intPtr(200_000)}
+	if got := UsageStatusCandidates(u); len(got) != 0 {
+		t.Fatalf("candidates = %#v, want none", got)
+	}
+	if got := FormatUsageStatus(u, FormatUsageOptions{}); got != "" {
+		t.Fatalf("status = %q, want empty", got)
+	}
+}
+
 func TestFormatUsageStatus_FullWhenNoMax(t *testing.T) {
 	got := FormatUsageStatus(usage(310_000, intPtr(1_000_000)), FormatUsageOptions{})
 	if got != "⛁ 31% (310k)" {

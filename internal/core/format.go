@@ -75,6 +75,9 @@ func formatTokenCount(tokens int) string {
 // UsageStatusCandidates returns candidates in priority order (longest -> shortest).
 // The first element is the full representation.
 func UsageStatusCandidates(usage ContextUsage) []string {
+	if usage.ContextUnavailable {
+		return nil
+	}
 	tokenLabel := formatTokenCount(usage.ContextTokens)
 
 	if usage.Compacted {

@@ -13,7 +13,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/senna-lang/herdr-agent-usage/internal/core"
 	"github.com/senna-lang/herdr-agent-usage/internal/fsutil"
+	providercontract "github.com/senna-lang/herdr-agent-usage/internal/provider"
+	"github.com/senna-lang/herdr-agent-usage/internal/providers"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/claude"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/codex"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/grok"
@@ -111,6 +114,18 @@ func resolveBilledPane(profiles []claude.ClaudeProfile, codexProfiles []codex.Co
 // CLAUDE_CONFIG_DIR — the read side (panel/sidebar) never sees that env var, so
 // per-profile billing detection must thread the resolved profile's paths.
 func paneBillingModeWith(profiles []claude.ClaudeProfile, codexProfiles []codex.CodexProfile, grokProfiles []grok.GrokProfile, openCodeProfiles []opencode.OpenCodeProfile, providerID string, pane OpenPaneSnapshot) BillingMode {
+	if session, found := SessionBillingForPane(pane); found {
+		// The adapter has already classified its own billing routes, so
+		// this layer never interprets a vendor billing string.
+		switch session.Class {
+		case core.BillingClassPayAsYouGo:
+			return BillingPayAsYouGo
+		case core.BillingClassSubscription:
+			return BillingSubscription
+		case core.BillingClassUnknown:
+			return BillingUnknown
+		}
+	}
 	if profile, ok := profileByIDIn(profiles, providerID); ok {
 		return claudePaneBillingModeIn(profile.ConfigDir, pane)
 	}
@@ -246,10 +261,32 @@ func opencodePaneBillingModeIn(dataDir string, pane OpenPaneSnapshot) BillingMod
 // ("deepseek", "openai", "anthropic"), or "" when the pane sits on a
 // subscription plan or its backend cannot be resolved.
 func PaneBackendID(providerID string, pane OpenPaneSnapshot) string {
+	if billing, ok := SessionBillingForPane(pane); ok {
+		switch billing.Class {
+		case core.BillingClassPayAsYouGo, core.BillingClassUnknown:
+			return billing.Backend
+		case core.BillingClassSubscription:
+			return ""
+		}
+	}
 	if PaneBillingMode(providerID, pane, DefaultBillingDeps()) != BillingPayAsYouGo {
 		return ""
 	}
 	return payAsYouGoBackendID(providerID, pane)
+}
+
+// SessionBillingForPane returns provider-recorded session facts independently
+// of whether the provider can classify those facts as subscription or PAYG.
+func SessionBillingForPane(pane OpenPaneSnapshot) (core.SessionBilling, bool) {
+	p := providers.FindProvider(pane.Agent)
+	if p == nil {
+		return core.SessionBilling{}, false
+	}
+	billing, ok := p.(providercontract.SessionBillingProvider)
+	if !ok {
+		return core.SessionBilling{}, false
+	}
+	return billing.ResolveSessionBilling(paneBillingInput(pane))
 }
 
 // payAsYouGoBackendID names the backend of an already-classified
@@ -258,6 +295,9 @@ func PaneBackendID(providerID string, pane OpenPaneSnapshot) string {
 // OpenCode / Codex record a per-session provider. Claude uses deployment
 // env (settings + process); Grok joins session modelId with config.toml.
 func payAsYouGoBackendID(providerID string, pane OpenPaneSnapshot) string {
+	if session, found := SessionBillingForPane(pane); found {
+		return session.Backend
+	}
 	if profile, ok := claudeProfileByID(providerID); ok {
 		return ResolveClaudeBackendID(loadClaudeEnvIn(profile.ConfigDir, cwdStr(pane)))
 	}

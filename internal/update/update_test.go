@@ -4,6 +4,7 @@
 package update
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/senna-lang/herdr-agent-usage/internal/herdrcli"
 	"github.com/senna-lang/herdr-agent-usage/internal/limits"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/claude"
+	_ "modernc.org/sqlite"
 )
 
 func stringPtr(s string) *string { return &s }
@@ -74,6 +76,68 @@ fi
 	}
 	if !strings.Contains(string(data), "--token title=review-pane") {
 		t.Fatalf("metadata calls = %q", data)
+	}
+}
+
+func TestRunUpdate_HermesUnknownBillingUnavailableContextWritesSessionCache(t *testing.T) {
+	root := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE sessions (
+ id TEXT PRIMARY KEY, model TEXT, model_config TEXT,
+ input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER,
+ cache_write_tokens INTEGER, billing_provider TEXT, billing_mode TEXT,
+ cost_status TEXT);
+CREATE TABLE messages (
+ id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, active INTEGER);
+INSERT INTO sessions VALUES
+ ('hermes-session','model-x','{}',100000,25000,300000,50000,'llm-rosetta','chat_completions','unknown')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	logPath := filepath.Join(root, "metadata.log")
+	binPath := filepath.Join(root, "fake-herdr")
+	script := `#!/bin/sh
+if [ "$1" = pane ] && [ "$2" = get ]; then
+  printf '%s\n' '{"result":{"pane":{"agent":"hermes","agent_session":{"agent":"hermes","kind":"id","value":"hermes-session"},"agent_status":"idle","cwd":"/tmp","tokens":{}}}}'
+  exit 0
+fi
+if [ "$1" = pane ] && [ "$2" = report-metadata ]; then
+  printf '%s\n' "$*" >> "$REVIEW_METADATA_LOG"
+fi
+`
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERDR_BIN_PATH", binPath)
+	t.Setenv("REVIEW_METADATA_LOG", logPath)
+	t.Setenv("HERMES_HOME", root)
+	t.Setenv("HOME", root)
+
+	RunUpdateForPane("p1", false)
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("Hermes pane produced no metadata: %v", err)
+	}
+	metadata := string(data)
+	for _, want := range []string{
+		"--token provider=llm-rosetta",
+		"--token limit=Σ 475k",
+		"--token cache_mid=cache hit 66.7%",
+	} {
+		if !strings.Contains(metadata, want) {
+			t.Errorf("metadata missing %q: %q", want, metadata)
+		}
+	}
+	if strings.Contains(metadata, "--token context=") {
+		t.Errorf("unavailable context was published: %q", metadata)
 	}
 }
 
@@ -204,6 +268,7 @@ func TestSidebarSecondRowContract(t *testing.T) {
 		fallback, display     string
 		providerLimits        *limits.ProviderLimits
 		tokens, cost          float64
+		hasSessionBilling     bool
 		wantProvider, wantLim string
 	}{
 		{
@@ -248,15 +313,21 @@ func TestSidebarSecondRowContract(t *testing.T) {
 			wantProvider: "opencode", wantLim: "5h 80%",
 		},
 		{
+			name: "unknown billing with recorded session facts shows backend burn",
+			mode: limits.BillingUnknown, fallback: "llm-rosetta", display: "",
+			tokens: 475_000, hasSessionBilling: true,
+			wantProvider: "llm-rosetta", wantLim: "Σ 475k",
+		},
+		{
 			name: "token only API burn omits dollars",
 			mode: limits.BillingPayAsYouGo, fallback: "deepseek", display: "",
-			tokens:       425_000,
+			tokens: 425_000, hasSessionBilling: true,
 			wantProvider: "deepseek", wantLim: "Σ 425k",
 		},
 		{
 			name: "cost capable harness includes dollars",
 			mode: limits.BillingPayAsYouGo, fallback: "deepseek", display: "",
-			tokens: 425_000, cost: 0.04,
+			tokens: 425_000, cost: 0.04, hasSessionBilling: true,
 			wantProvider: "deepseek", wantLim: "Σ 425k $0.04",
 		},
 	}
@@ -264,7 +335,7 @@ func TestSidebarSecondRowContract(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			providerText, limitText := formatSidebarBillingTokens(
 				tt.mode, tt.fallback, tt.display, tt.providerLimits,
-				tt.tokens, tt.cost, 1_800_000_000_000, "",
+				tt.tokens, tt.cost, tt.hasSessionBilling, 1_800_000_000_000, "",
 			)
 			if providerText != tt.wantProvider || limitText != tt.wantLim {
 				t.Fatalf("got provider=%q limit=%q, want provider=%q limit=%q", providerText, limitText, tt.wantProvider, tt.wantLim)

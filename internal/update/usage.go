@@ -29,6 +29,9 @@ func resolvePaneUsage(
 	if pane.Agent == nil || usageProvider == nil {
 		return nil
 	}
+	if _, ok := usageProvider.(provider.SessionBillingProvider); ok {
+		return usageProvider.ResolveUsage(provider.UsageResolveInput{Session: pane.AgentSession, Cwd: paneCwdForUpdate(pane), PaneID: &paneID})
+	}
 
 	cwd := paneCwdForUpdate(pane)
 	var sessionID *string
