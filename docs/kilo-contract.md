@@ -61,6 +61,16 @@ already belong to the other pane. If the open-pane list cannot be read, the
 fallback attributes nothing rather than guess. A lone pane in the directory
 still recovers.
 
+The open-pane check uses the same foreground cwd that the sidebar uses for
+session resolution, not the directory the pane's shell originally started in.
+It reads the live pane list for each fallback rather than caching attribution:
+opening another pane must invalidate the assumption that this directory is
+unshared immediately.
+
+When Herdr reports a session id for another open Kilo pane, the cwd fallback
+also rejects that id even if the requesting pane is not yet present in the
+list. A directory match never overrides an explicit ownership claim.
+
 "Recorded in this directory" is broader than "could be this pane's session", and
 the scope drops the two kinds of row that cannot be:
 

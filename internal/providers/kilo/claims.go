@@ -16,8 +16,9 @@ import (
 
 // OpenPaneClaim is one pane currently open in Herdr.
 type OpenPaneClaim struct {
-	Agent string
-	Cwd   string
+	Agent     string
+	Cwd       string
+	SessionID string
 }
 
 // ListOpenPanes, when set, reports the panes Herdr currently has open.
@@ -48,6 +49,19 @@ func directoryIsShared(directory string, panes []OpenPaneClaim) bool {
 		}
 		matches++
 		if matches > 1 {
+			return true
+		}
+	}
+	return false
+}
+
+// sessionClaimedByOpenPane prevents a stale or not-yet-listed pane from
+// borrowing a candidate that Herdr already attributes to another Kilo pane.
+// The reported id cannot be this pane's: resolveSessionIDIn only reaches the
+// cwd fallback after this pane's own id failed to resolve.
+func sessionClaimedByOpenPane(id string, panes []OpenPaneClaim) bool {
+	for _, pane := range panes {
+		if strings.EqualFold(strings.TrimSpace(pane.Agent), "kilo") && pane.SessionID == id {
 			return true
 		}
 	}

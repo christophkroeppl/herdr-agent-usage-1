@@ -512,7 +512,7 @@ func TestResolveUsage_CwdFallbackRefusesADirectoryAnotherPaneHasOpen(t *testing.
 func TestResolveUsage_CwdFallbackStillRecoversTheOnlyOpenPane(t *testing.T) {
 	useStore(t, writeSessions(t, "/repo"))
 	ListOpenPanes = func() ([]OpenPaneClaim, bool) {
-		return []OpenPaneClaim{{Agent: "kilo", Cwd: "/repo"}}, true
+		return []OpenPaneClaim{{Agent: "kilo", Cwd: "/repo", SessionID: "ses_gone"}}, true
 	}
 	t.Cleanup(func() { ListOpenPanes = nil })
 

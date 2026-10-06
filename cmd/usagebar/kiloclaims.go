@@ -1,46 +1,40 @@
 package main
 
 import (
-	"sync"
-	"time"
-
 	"github.com/senna-lang/herdr-agent-usage/internal/herdrcli"
 	"github.com/senna-lang/herdr-agent-usage/internal/providers/kilo"
 )
 
-// kiloClaimTTL keeps one pane-list read across the several Kilo lookups a
-// single sidebar refresh makes (context, billing, spend).
-const kiloClaimTTL = 2 * time.Second
-
 func init() {
-	var (
-		mu    sync.Mutex
-		at    time.Time
-		panes []kilo.OpenPaneClaim
-		ok    bool
-	)
-	kilo.ListOpenPanes = func() ([]kilo.OpenPaneClaim, bool) {
-		mu.Lock()
-		defer mu.Unlock()
-		if !at.IsZero() && time.Since(at) < kiloClaimTTL {
-			return panes, ok
-		}
-		listed, listedOK := herdrcli.ListOpenAgentPanesOK()
-		at = time.Now()
-		ok = listedOK
-		panes = panes[:0]
-		if !listedOK {
-			return nil, false
-		}
-		for _, pane := range listed {
-			claim := kilo.OpenPaneClaim{Cwd: deref(pane.Cwd)}
-			if pane.Agent != nil {
-				claim.Agent = *pane.Agent
-			}
-			panes = append(panes, claim)
-		}
-		return panes, true
+	kilo.ListOpenPanes = listKiloOpenPaneClaims
+}
+
+// listKiloOpenPaneClaims uses the same foreground-cwd preference as the
+// sidebar. A pane may have been launched from another directory and changed
+// into its project; comparing its original cwd would miss a competing pane.
+// Always read the current list: cached identity evidence can attribute the
+// other pane's session immediately after a new pane opens.
+func listKiloOpenPaneClaims() ([]kilo.OpenPaneClaim, bool) {
+	listed, ok := herdrcli.ListOpenAgentPanesOK()
+	if !ok {
+		return nil, false
 	}
+	return kiloOpenPaneClaims(listed), true
+}
+
+func kiloOpenPaneClaims(listed []herdrcli.OpenAgentPane) []kilo.OpenPaneClaim {
+	panes := make([]kilo.OpenPaneClaim, 0, len(listed))
+	for _, pane := range listed {
+		claim := kilo.OpenPaneClaim{Cwd: deref(herdrcli.PaneSessionCwd(pane.PaneInfo))}
+		if pane.Agent != nil {
+			claim.Agent = *pane.Agent
+		}
+		if pane.AgentSession != nil && pane.AgentSession.Kind == "id" {
+			claim.SessionID = pane.AgentSession.Value
+		}
+		panes = append(panes, claim)
+	}
+	return panes
 }
 
 func deref(s *string) string {

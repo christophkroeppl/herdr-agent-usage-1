@@ -223,8 +223,10 @@ func resolveSessionIDByCwd(db *sql.DB, cwd string) string {
 	// Kilo pane may already own it, and this pane may have no session yet. The
 	// host's pane list is what makes that visible; without a readable list the
 	// fallback cannot prove the directory is this pane's alone.
+	var panes []OpenPaneClaim
 	if ListOpenPanes != nil {
-		panes, ok := ListOpenPanes()
+		var ok bool
+		panes, ok = ListOpenPanes()
 		if !ok || directoryIsShared(directory, panes) {
 			return ""
 		}
@@ -252,6 +254,9 @@ func resolveSessionIDByCwd(db *sql.DB, cwd string) string {
 			return ""
 		}
 		found = id
+	}
+	if found != "" && sessionClaimedByOpenPane(found, panes) {
+		return ""
 	}
 	return found
 }
