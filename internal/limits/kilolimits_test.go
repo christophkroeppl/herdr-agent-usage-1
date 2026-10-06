@@ -571,6 +571,27 @@ func TestCollectKiloLimits_AFailedAttemptIsNotServedAsAFreshWindow(t *testing.T)
 	}
 }
 
+func TestCollectKiloLimits_ALiveStatusWithoutAmountsPreservesTheWindow(t *testing.T) {
+	// status: active with neither allowance nor spend names a plan but not a
+	// ratio. That is a missing fact, not "no Kilo Pass", and must not clear the
+	// window the previous reading established.
+	f := newKiloFixture(t)
+	if got := f.collect(t, subscribed(), nil); got.Tertiary == nil {
+		t.Fatalf("setup: %+v", got)
+	}
+
+	statusOnly := f.collect(t, &KiloPassState{Status: "active"}, nil)
+	if statusOnly.Tertiary != nil || statusOnly.Source != "none" {
+		t.Fatalf("a status-only response was metered: %+v", statusOnly)
+	}
+	if statusOnly.Note == nil || strings.Contains(*statusOnly.Note, "no Kilo Pass") {
+		t.Fatalf("note = %v, want a missing-allowance failure, not a cleared plan", statusOnly.Note)
+	}
+	if month := f.cached(t); month == nil {
+		t.Fatal("a status-only response cleared the last good window")
+	}
+}
+
 func TestCollectKiloLimits_ALegacyFailedEntryIsReReadRatherThanServed(t *testing.T) {
 	// An entry written before failures were stored apart carries the snapshot and
 	// nothing saying it failed. Re-reading costs one request; serving that

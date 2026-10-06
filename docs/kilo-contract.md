@@ -53,8 +53,13 @@ exists; the pane's cwd is the fallback.
 The fallback only attributes a session when it is **unambiguous**. Two live Kilo
 panes in one repository share a cwd, so "the newest session in this directory"
 is not evidence of which pane asked: once one pane resets its session, the newest
-row is the other pane's. Two or more live sessions in scope therefore yield no
-reading rather than another pane's context, backend and spend.
+row is the other pane's, and a pane that has not started a session yet has no id
+to cross against. Two or more live sessions in scope therefore yield no reading.
+The same refusal applies when Herdr reports another open Kilo pane in the same
+directory tree, even if the store holds only one live session: that session may
+already belong to the other pane. If the open-pane list cannot be read, the
+fallback attributes nothing rather than guess. A lone pane in the directory
+still recovers.
 
 "Recorded in this directory" is broader than "could be this pane's session", and
 the scope drops the two kinds of row that cannot be:
@@ -138,8 +143,9 @@ instead of clearing it.
 The two failure kinds are kept apart deliberately. A request that fails —
 transport, auth, server, decode — saves nothing, so the last good reading for
 that account survives: a blip is not evidence that the plan ended. The same
-holds for a response that names a plan but not a usable ratio, and for one that
-names no status, neither of which says the account lost its Pass.
+holds for a response that names a plan but not a usable ratio, for one that
+names no status, and for one that names a live status but neither allowance nor
+spend. None of those says the account lost its Pass, so none of them clears.
 
 The cache stores the outcome, the last good reading and the failed attempt as
 three separate fields, because preserving a reading and reporting it are

@@ -219,6 +219,16 @@ func resolveSessionIDByCwd(db *sql.DB, cwd string) string {
 	if directory == "" {
 		return ""
 	}
+	// A single live session in this directory is not attribution. Another open
+	// Kilo pane may already own it, and this pane may have no session yet. The
+	// host's pane list is what makes that visible; without a readable list the
+	// fallback cannot prove the directory is this pane's alone.
+	if ListOpenPanes != nil {
+		panes, ok := ListOpenPanes()
+		if !ok || directoryIsShared(directory, panes) {
+			return ""
+		}
+	}
 	floor := time.Now().UnixMilli() - liveSessionWindowMs
 	separator := string(filepath.Separator)
 	rows, err := db.Query(directoryScopeQuery, floor, directory, escapeLike(directory+separator)+"%")

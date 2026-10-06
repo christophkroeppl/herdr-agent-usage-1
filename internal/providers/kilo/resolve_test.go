@@ -482,6 +482,55 @@ func TestResolveUsage_CwdFallbackIgnoresSessionsNoPaneCanBeUsing(t *testing.T) {
 	})
 }
 
+func TestResolveUsage_CwdFallbackRefusesADirectoryAnotherPaneHasOpen(t *testing.T) {
+	// One live session is not attribution when another Kilo pane is open in the
+	// same repository. The new pane has no session yet; the session on disk is
+	// the other pane's.
+	useStore(t, writeSessions(t, "/repo"))
+	ListOpenPanes = func() ([]OpenPaneClaim, bool) {
+		return []OpenPaneClaim{
+			{Agent: "kilo", Cwd: "/repo"},
+			{Agent: "kilo", Cwd: "/repo"},
+		}, true
+	}
+	t.Cleanup(func() { ListOpenPanes = nil })
+
+	if usage := ResolveUsageForKilo(nil, strPtr("/repo")); usage != nil {
+		t.Fatalf("a pane with no session borrowed the other pane's context: %+v", usage)
+	}
+	if usage := ResolveUsageForKilo(strPtr("ses_gone"), strPtr("/repo")); usage != nil {
+		t.Fatalf("a stale id borrowed the other pane's context: %+v", usage)
+	}
+	if backend := BackendForKilo(nil, strPtr("/repo")); backend != "" {
+		t.Fatalf("billing named %q for a pane that does not own the session", backend)
+	}
+	if rows := PaneSpend(nil, strPtr("/repo"), "kilo", 0, nowForTest()); rows != nil {
+		t.Fatalf("a pane with no session reported the other pane's spend: %d rows", len(rows))
+	}
+}
+
+func TestResolveUsage_CwdFallbackStillRecoversTheOnlyOpenPane(t *testing.T) {
+	useStore(t, writeSessions(t, "/repo"))
+	ListOpenPanes = func() ([]OpenPaneClaim, bool) {
+		return []OpenPaneClaim{{Agent: "kilo", Cwd: "/repo"}}, true
+	}
+	t.Cleanup(func() { ListOpenPanes = nil })
+
+	if usage := ResolveUsageForKilo(strPtr("ses_gone"), strPtr("/repo")); usage == nil {
+		t.Fatal("the only open pane in the directory did not recover")
+	}
+}
+
+func TestResolveUsage_CwdFallbackRefusesWhenThePaneListCannotBeRead(t *testing.T) {
+	useStore(t, writeSessions(t, "/repo"))
+	ListOpenPanes = func() ([]OpenPaneClaim, bool) { return nil, false }
+	t.Cleanup(func() { ListOpenPanes = nil })
+
+	if usage := ResolveUsageForKilo(strPtr("ses_gone"), strPtr("/repo")); usage != nil {
+		t.Fatalf("an unreadable pane list still attributed a session: %+v", usage)
+	}
+}
+
 func TestQueriesAreBoundedAndReadOnly(t *testing.T) {
 	// A whole-table scan would be a bug: the store is a live WAL database with
 	// hundreds of thousands of rows.

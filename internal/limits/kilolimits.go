@@ -295,6 +295,16 @@ func kiloProviderLimits(providerID, label string, q kiloPassQuery, nowMs int64) 
 		return pl, kiloPassFailed
 	}
 
+	// A named plan with no usable ratio is a missing fact, not "no Kilo Pass".
+	// status alone (active, with neither allowance nor spend) used to fall
+	// through to the shared-balance branch and clear the last good window.
+	if q.Pass.HasSubscription() {
+		pl.Source = "none"
+		pl.Note = kiloAccountNote(q.Balance, q.BalanceErr, strPtr(
+			"Kilo Pass reported a subscription without a usable credit allowance, so this period cannot be metered"))
+		return pl, kiloPassFailed
+	}
+
 	switch {
 	case q.PassErr != nil:
 		// A request that failed says nothing about the account.
